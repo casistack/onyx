@@ -1,0 +1,173 @@
+name: Build GHCR Images
+
+on:
+  push:
+    branches:
+      - mybranch
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional Docker tag override
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-ghcr-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      image_namespace: ${{ steps.meta.outputs.image_namespace }}
+    steps:
+      - name: Derive image tags
+        id: meta
+        shell: bash
+        env:
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_IMAGE_TAG" ]; then
+            RAW_TAG="$INPUT_IMAGE_TAG"
+          else
+            RAW_TAG="$REF_NAME"
+          fi
+
+          IMAGE_TAG=$(echo "$RAW_TAG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')
+          SHA_TAG="sha-$(echo "$GITHUB_SHA" | cut -c1-12)"
+          IMAGE_NAMESPACE=$(echo "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_namespace=$IMAGE_NAMESPACE" >> "$GITHUB_OUTPUT"
+
+  build-backend:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # ratchet:docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # ratchet:docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # ratchet:docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile-mine
+          push: true
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-backend:${{ needs.prepare.outputs.image_tag }}
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-backend:${{ needs.prepare.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=onyx-backend
+          cache-to: type=gha,mode=max,scope=onyx-backend
+
+  build-web:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # ratchet:docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # ratchet:docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push web image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # ratchet:docker/build-push-action@v6
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-web-server:${{ needs.prepare.outputs.image_tag }}
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-web-server:${{ needs.prepare.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_DISABLE_LOGOUT=${{ vars.NEXT_PUBLIC_DISABLE_LOGOUT }}
+            NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED=${{ vars.NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED }}
+            NEXT_PUBLIC_THEME=${{ vars.NEXT_PUBLIC_THEME }}
+            NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED=${{ vars.NEXT_PUBLIC_DO_NOT_USE_TOGGLE_OFF_DANSWER_POWERED }}
+            NEXT_PUBLIC_CUSTOM_REFRESH_URL=${{ vars.NEXT_PUBLIC_CUSTOM_REFRESH_URL }}
+            NEXT_PUBLIC_POSTHOG_KEY=${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
+            NEXT_PUBLIC_POSTHOG_HOST=${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
+            NEXT_PUBLIC_CLOUD_ENABLED=${{ vars.NEXT_PUBLIC_CLOUD_ENABLED }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ vars.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_GTM_ENABLED=${{ vars.NEXT_PUBLIC_GTM_ENABLED }}
+            NEXT_PUBLIC_INCLUDE_ERROR_POPUP_SUPPORT_LINK=${{ vars.NEXT_PUBLIC_INCLUDE_ERROR_POPUP_SUPPORT_LINK }}
+            NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${{ vars.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+            NEXT_PUBLIC_RECAPTCHA_SITE_KEY=${{ vars.NEXT_PUBLIC_RECAPTCHA_SITE_KEY }}
+            NODE_OPTIONS=--max-old-space-size=4096
+          cache-from: type=gha,scope=onyx-web
+          cache-to: type=gha,mode=max,scope=onyx-web
+
+  build-model-server:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # ratchet:docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # ratchet:docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push model server image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # ratchet:docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.model_server
+          push: true
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-model-server:${{ needs.prepare.outputs.image_tag }}
+            ghcr.io/${{ needs.prepare.outputs.image_namespace }}/onyx-model-server:${{ needs.prepare.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=onyx-model-server
+          cache-to: type=gha,mode=max,scope=onyx-model-server
