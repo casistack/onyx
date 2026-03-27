@@ -142,9 +142,7 @@ services:
       - ':3000'
 
   inference_model_server:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.model_server
+    image: onyxdotapp/onyx-model-server:${IMAGE_TAG:-latest}
     command: >
       /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
         echo 'Skipping service...';
@@ -171,9 +169,7 @@ services:
       retries: 3
 
   indexing_model_server:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.model_server
+    image: onyxdotapp/onyx-model-server:${IMAGE_TAG:-latest}
     command: >
       /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
         echo 'Skipping service...';
