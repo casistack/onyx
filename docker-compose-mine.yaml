@@ -39,7 +39,7 @@ services:
   api_server:
     build:
       context: ./backend
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile-mine
     command: >
       /bin/sh -c "alembic upgrade head &&
       echo \"Starting Onyx Api Server\" &&
@@ -80,7 +80,7 @@ services:
   background:
     build:
       context: ./backend
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile-mine
     command: >
       /bin/sh -c "if [ -f /etc/ssl/certs/custom-ca.crt ]; then
         update-ca-certificates;
