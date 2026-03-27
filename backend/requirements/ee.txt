@@ -298,7 +298,7 @@ tqdm==4.67.1
     # via
     #   huggingface-hub
     #   openai
-types-requests==2.32.0.20250328
+types-requests==2.32.4.20260107
     # via cohere
 typing-extensions==4.15.0
     # via

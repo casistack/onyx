@@ -509,7 +509,7 @@ types-pyyaml==6.0.12.11
     # via onyx
 types-regex==2023.3.23.1
     # via onyx
-types-requests==2.32.0.20250328
+types-requests==2.32.4.20260107
     # via
     #   cohere
     #   onyx

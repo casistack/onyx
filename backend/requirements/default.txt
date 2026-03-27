@@ -1040,7 +1040,7 @@ types-awscrt==0.28.4
     # via botocore-stubs
 types-openpyxl==3.0.4.7
     # via onyx
-types-requests==2.32.0.20250328
+types-requests==2.32.4.20260107
     # via cohere
 types-s3transfer==0.14.0
     # via boto3-stubs
