@@ -26,8 +26,16 @@ jobs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       sha_tag: ${{ steps.meta.outputs.sha_tag }}
       image_namespace: ${{ steps.meta.outputs.image_namespace }}
+      upstream_base_version: ${{ steps.meta.outputs.upstream_base_version }}
+      onyx_version: ${{ steps.meta.outputs.onyx_version }}
     steps:
-      - name: Derive image tags
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive image tags and version
         id: meta
         shell: bash
         env:
@@ -35,6 +43,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
@@ -48,9 +57,27 @@ jobs:
           SHA_TAG="sha-$(echo "$GITHUB_SHA" | cut -c1-12)"
           IMAGE_NAMESPACE=$(echo "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
 
+          git fetch --force --tags https://github.com/onyx-dot-app/onyx.git
+
+          UPSTREAM_BASE_VERSION="$(
+            git tag \
+              --merged HEAD \
+              --list 'v[0-9]*.[0-9]*.[0-9]*' \
+              --sort=-version:refname \
+              | head -n1
+          )"
+
+          if [ -z "$UPSTREAM_BASE_VERSION" ]; then
+            UPSTREAM_BASE_VERSION="v0.0.0"
+          fi
+
+          ONYX_VERSION="${UPSTREAM_BASE_VERSION}-fork.${GITHUB_RUN_NUMBER}"
+
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
           echo "image_namespace=$IMAGE_NAMESPACE" >> "$GITHUB_OUTPUT"
+          echo "upstream_base_version=$UPSTREAM_BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "onyx_version=$ONYX_VERSION" >> "$GITHUB_OUTPUT"
 
   build-backend:
     needs: prepare
@@ -84,6 +111,9 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
+          build-args: |
+            ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
           cache-from: type=gha,scope=onyx-backend
           cache-to: type=gha,mode=max,scope=onyx-backend
 
@@ -119,7 +149,9 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
           build-args: |
+            ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
             NEXT_PUBLIC_DISABLE_LOGOUT=${{ vars.NEXT_PUBLIC_DISABLE_LOGOUT }}
             NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED=${{ vars.NEXT_PUBLIC_FORGOT_PASSWORD_ENABLED }}
             NEXT_PUBLIC_THEME=${{ vars.NEXT_PUBLIC_THEME }}
@@ -169,5 +201,8 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
+          build-args: |
+            ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
           cache-from: type=gha,scope=onyx-model-server
           cache-to: type=gha,mode=max,scope=onyx-model-server
