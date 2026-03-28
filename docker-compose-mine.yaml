@@ -38,6 +38,7 @@ x-onyx-common-env: &onyx-common-env
 services:
   api_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-backend:${IMAGE_TAG:-mybranch}
+    pull_policy: always
     command: >
       /bin/sh -c "alembic upgrade head &&
       echo \"Starting Onyx Api Server\" &&
@@ -77,6 +78,7 @@ services:
 
   background:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-backend:${IMAGE_TAG:-mybranch}
+    pull_policy: always
     command: >
       /bin/sh -c "if [ -f /etc/ssl/certs/custom-ca.crt ]; then
         update-ca-certificates;
@@ -116,6 +118,7 @@ services:
 
   web_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-web-server:${IMAGE_TAG:-mybranch}
+    pull_policy: always
     depends_on:
       - api_server
     restart: unless-stopped
@@ -132,6 +135,7 @@ services:
 
   inference_model_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-model-server:${IMAGE_TAG:-mybranch}
+    pull_policy: always
     command: >
       /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
         echo 'Skipping service...';
@@ -159,6 +163,7 @@ services:
 
   indexing_model_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-model-server:${IMAGE_TAG:-mybranch}
+    pull_policy: always
     command: >
       /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
         echo 'Skipping service...';
@@ -263,6 +268,7 @@ services:
 
   code-interpreter:
     image: onyxdotapp/code-interpreter:${CODE_INTERPRETER_IMAGE_TAG:-latest}
+    pull_policy: always
     command: ["bash", "./entrypoint.sh", "code-interpreter-api"]
     restart: unless-stopped
     user: root
