@@ -349,7 +349,7 @@ def run_tool_calls(
             updated_citation_mapping=citation_mapping,
         )
 
-    tools_by_name = {tool.name: tool for tool in tools}
+    tools_by_name = {tool.llm_name: tool for tool in tools}
 
     # Drop unknown tools (and don't let them count against the cap)
     filtered_tool_calls: list[ToolCallKickoff] = []

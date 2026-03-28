@@ -269,7 +269,7 @@ def run_research_agent_call(
                     logger.debug("Auto-generating intermediate report on last cycle.")
                     break
 
-                tools_by_name = {tool.name: tool for tool in current_tools}
+                tools_by_name = {tool.llm_name: tool for tool in current_tools}
 
                 tools_description = generate_tools_description(current_tools)
 

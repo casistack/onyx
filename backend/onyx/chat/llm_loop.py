@@ -968,7 +968,7 @@ def run_llm_loop(
                         pass
 
                 # Build a mapping of tool names to tool objects for getting tool_id
-                tools_by_name = {tool.name: tool for tool in final_tools}
+                tools_by_name = {tool.llm_name: tool for tool in final_tools}
 
                 # Add the results to the chat history. Even though tools may run in parallel,
                 # LLM APIs require linear history, so results are added sequentially.

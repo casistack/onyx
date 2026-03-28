@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 from typing import Any
 
 from mcp.client.auth import OAuthClientProvider
@@ -19,6 +21,26 @@ from onyx.tools.tool_implementations.mcp.mcp_client import call_mcp_tool
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
+
+_MCP_TOOL_NAME_SANITIZER = re.compile(r"[^A-Za-z0-9_-]+")
+_MAX_LLM_TOOL_NAME_LENGTH = 64
+
+
+def _build_llm_tool_name(server_name: str, tool_name: str) -> str:
+    raw_name = f"mcp_{server_name}_{tool_name}"
+    sanitized_name = _MCP_TOOL_NAME_SANITIZER.sub("_", raw_name).strip("_")
+    if not sanitized_name:
+        sanitized_name = "mcp_tool"
+
+    if len(sanitized_name) <= _MAX_LLM_TOOL_NAME_LENGTH:
+        return sanitized_name
+
+    digest = hashlib.sha1(f"{server_name}:{tool_name}".encode("utf-8")).hexdigest()[:12]
+    prefix_length = _MAX_LLM_TOOL_NAME_LENGTH - len(digest) - 1
+    truncated_prefix = sanitized_name[:prefix_length].rstrip("_")
+    if not truncated_prefix:
+        truncated_prefix = "mcp_tool"
+    return f"{truncated_prefix}_{digest}"
 
 # Headers that cannot be overridden by user requests to prevent security issues
 # Host header is particularly critical - it can be used for Host Header Injection attacks
@@ -67,7 +89,7 @@ class MCPTool(Tool[None]):
         self._tool_definition = tool_definition
         self._description = tool_description
         self._display_name = tool_definition.get("displayName", tool_name)
-        self._llm_name = f"mcp:{mcp_server.name}:{tool_name}"
+        self._llm_name = _build_llm_tool_name(mcp_server.name, tool_name)
 
     @property
     def id(self) -> int:
@@ -95,7 +117,7 @@ class MCPTool(Tool[None]):
         return {
             "type": "function",
             "function": {
-                "name": self._name,
+                "name": self.llm_name,
                 "description": self._description,
                 "parameters": self._tool_definition,
             },

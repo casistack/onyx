@@ -54,9 +54,9 @@ def generate_tools_description(tools: list[Tool]) -> str:
     if not tools:
         return ""
     if len(tools) == 1:
-        return tools[0].name
+        return tools[0].llm_name
     if len(tools) == 2:
-        return f"{tools[0].name} and {tools[1].name}"
+        return f"{tools[0].llm_name} and {tools[1].llm_name}"
 
-    names = [tool.name for tool in tools[:-1]]
-    return ", ".join(names) + f", and {tools[-1].name}"
+    names = [tool.llm_name for tool in tools[:-1]]
+    return ", ".join(names) + f", and {tools[-1].llm_name}"

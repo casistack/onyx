@@ -41,6 +41,11 @@ class Tool(abc.ABC, Generic[TOverride]):
         raise NotImplementedError
 
     @property
+    def llm_name(self) -> str:
+        """Model-facing tool name. Defaults to the canonical tool name."""
+        return self.name
+
+    @property
     @abc.abstractmethod
     def description(self) -> str:
         raise NotImplementedError
