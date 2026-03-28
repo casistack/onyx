@@ -27,6 +27,7 @@ jobs:
       sha_tag: ${{ steps.meta.outputs.sha_tag }}
       image_namespace: ${{ steps.meta.outputs.image_namespace }}
       upstream_base_version: ${{ steps.meta.outputs.upstream_base_version }}
+      upstream_reference_tag: ${{ steps.meta.outputs.upstream_reference_tag }}
       onyx_version: ${{ steps.meta.outputs.onyx_version }}
     steps:
       - name: Checkout
@@ -59,16 +60,28 @@ jobs:
 
           git fetch --force --tags https://github.com/onyx-dot-app/onyx.git
 
+          UPSTREAM_REFERENCE_TAG="$(
+            git tag \
+              --merged HEAD \
+              --list 'v[0-9]*' \
+              --sort=-version:refname \
+              | sed -n '1p'
+          )"
+
           UPSTREAM_BASE_VERSION="$(
             git tag \
               --merged HEAD \
-              --list 'v[0-9]*.[0-9]*.[0-9]*' \
               --sort=-version:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
               | sed -n '1p'
           )"
 
           if [ -z "$UPSTREAM_BASE_VERSION" ]; then
             UPSTREAM_BASE_VERSION="v0.0.0"
+          fi
+
+          if [ -z "$UPSTREAM_REFERENCE_TAG" ]; then
+            UPSTREAM_REFERENCE_TAG="$UPSTREAM_BASE_VERSION"
           fi
 
           ONYX_VERSION="${UPSTREAM_BASE_VERSION}-fork.${GITHUB_RUN_NUMBER}"
@@ -77,6 +90,7 @@ jobs:
           echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
           echo "image_namespace=$IMAGE_NAMESPACE" >> "$GITHUB_OUTPUT"
           echo "upstream_base_version=$UPSTREAM_BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "upstream_reference_tag=$UPSTREAM_REFERENCE_TAG" >> "$GITHUB_OUTPUT"
           echo "onyx_version=$ONYX_VERSION" >> "$GITHUB_OUTPUT"
 
   build-backend:
@@ -112,6 +126,8 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
+            io.casistack.onyx.upstream-base-version=${{ needs.prepare.outputs.upstream_base_version }}
+            io.casistack.onyx.upstream-reference-tag=${{ needs.prepare.outputs.upstream_reference_tag }}
           build-args: |
             ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
           cache-from: type=gha,scope=onyx-backend
@@ -150,6 +166,8 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
+            io.casistack.onyx.upstream-base-version=${{ needs.prepare.outputs.upstream_base_version }}
+            io.casistack.onyx.upstream-reference-tag=${{ needs.prepare.outputs.upstream_reference_tag }}
           build-args: |
             ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
             NEXT_PUBLIC_DISABLE_LOGOUT=${{ vars.NEXT_PUBLIC_DISABLE_LOGOUT }}
@@ -202,6 +220,8 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.onyx_version }}
+            io.casistack.onyx.upstream-base-version=${{ needs.prepare.outputs.upstream_base_version }}
+            io.casistack.onyx.upstream-reference-tag=${{ needs.prepare.outputs.upstream_reference_tag }}
           build-args: |
             ONYX_VERSION=${{ needs.prepare.outputs.onyx_version }}
           cache-from: type=gha,scope=onyx-model-server
