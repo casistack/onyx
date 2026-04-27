@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from onyx.background.celery.apps.app_base import task_logger
 from onyx.background.celery.celery_redis import celery_find_task
+from onyx.background.celery.celery_redis import celery_get_broker_client
 from onyx.background.celery.celery_redis import celery_get_unacked_task_ids
 from onyx.background.celery.celery_utils import httpx_init_vespa_pool
 from onyx.background.celery.memory_monitoring import emit_process_memory
@@ -104,6 +105,9 @@ from onyx.redis.redis_pool import get_redis_replica_client
 from onyx.redis.redis_pool import redis_lock_dump
 from onyx.redis.redis_pool import SCAN_ITER_COUNT_DEFAULT
 from onyx.redis.redis_utils import is_fence
+from onyx.server.metrics.connector_health_metrics import on_connector_error_state_change
+from onyx.server.metrics.connector_health_metrics import on_connector_indexing_success
+from onyx.server.metrics.connector_health_metrics import on_index_attempt_status_change
 from onyx.server.runtime.onyx_runtime import OnyxRuntime
 from onyx.utils.logger import setup_logger
 from onyx.utils.middleware import make_randomized_onyx_request_id
@@ -318,6 +322,11 @@ def monitor_indexing_attempt_progress(
     )
 
     current_db_time = get_db_current_time(db_session)
+    total_batches: int | str = (
+        coordination_status.total_batches
+        if coordination_status.total_batches is not None
+        else "?"
+    )
     if coordination_status.found:
         task_logger.info(
             f"Indexing attempt progress: "
@@ -325,7 +334,7 @@ def monitor_indexing_attempt_progress(
             f"cc_pair={attempt.connector_credential_pair_id} "
             f"search_settings={attempt.search_settings_id} "
             f"completed_batches={coordination_status.completed_batches} "
-            f"total_batches={coordination_status.total_batches or '?'} "
+            f"total_batches={total_batches} "
             f"total_docs={coordination_status.total_docs} "
             f"total_failures={coordination_status.total_failures}"
             f"elapsed={(current_db_time - attempt.time_created).seconds}"
@@ -394,7 +403,6 @@ def check_indexing_completion(
     tenant_id: str,
     task: Task,
 ) -> None:
-
     logger.info(
         f"Checking for indexing completion: attempt={index_attempt_id} tenant={tenant_id}"
     )
@@ -409,7 +417,7 @@ def check_indexing_completion(
     logger.info(
         f"Indexing status: "
         f"indexing_completed={indexing_completed} "
-        f"batches_processed={batches_processed}/{batches_total or '?'} "
+        f"batches_processed={batches_processed}/{batches_total if batches_total is not None else '?'} "
         f"total_docs={coordination_status.total_docs} "
         f"total_chunks={coordination_status.total_chunks} "
         f"total_failures={coordination_status.total_failures}"
@@ -449,7 +457,7 @@ def check_indexing_completion(
             ):
                 # Check if the task exists in the celery queue
                 # This handles the case where Redis dies after task creation but before task execution
-                redis_celery = task.app.broker_connection().channel().client  # type: ignore
+                redis_celery = celery_get_broker_client(task.app)
                 task_exists = celery_find_task(
                     attempt.celery_task_id,
                     OnyxCeleryQueues.CONNECTOR_DOC_FETCHING,
@@ -515,12 +523,24 @@ def check_indexing_completion(
 
         # Update CC pair status if successful
         cc_pair = get_connector_credential_pair_from_id(
-            db_session, attempt.connector_credential_pair_id
+            db_session,
+            attempt.connector_credential_pair_id,
+            eager_load_connector=True,
         )
         if cc_pair is None:
             raise RuntimeError(
                 f"CC pair {attempt.connector_credential_pair_id} not found in database"
             )
+
+        source = cc_pair.connector.source.value
+        connector_name = cc_pair.connector.name or f"cc_pair_{cc_pair.id}"
+        on_index_attempt_status_change(
+            tenant_id=tenant_id,
+            source=source,
+            cc_pair_id=cc_pair.id,
+            connector_name=connector_name,
+            status=attempt.status.value,
+        )
 
         if attempt.status.is_successful():
             # NOTE: we define the last successful index time as the time the last successful
@@ -542,10 +562,26 @@ def check_indexing_completion(
                 event=MilestoneRecordType.CONNECTOR_SUCCEEDED,
             )
 
+            on_connector_indexing_success(
+                tenant_id=tenant_id,
+                source=source,
+                cc_pair_id=cc_pair.id,
+                connector_name=connector_name,
+                docs_indexed=attempt.new_docs_indexed or 0,
+                success_timestamp=attempt.time_updated.timestamp(),
+            )
+
             # Clear repeated error state on success
             if cc_pair.in_repeated_error_state:
                 cc_pair.in_repeated_error_state = False
                 db_session.commit()
+                on_connector_error_state_change(
+                    tenant_id=tenant_id,
+                    source=source,
+                    cc_pair_id=cc_pair.id,
+                    connector_name=connector_name,
+                    in_error=False,
+                )
 
             if attempt.status == IndexingStatus.SUCCESS:
                 logger.info(
@@ -841,6 +877,16 @@ def check_for_indexing(self: Task, *, tenant_id: str) -> int | None:
                         db_session=db_session,
                         cc_pair_id=cc_pair_id,
                         in_repeated_error_state=True,
+                    )
+                    error_connector_name = (
+                        cc_pair.connector.name or f"cc_pair_{cc_pair.id}"
+                    )
+                    on_connector_error_state_change(
+                        tenant_id=tenant_id,
+                        source=cc_pair.connector.source.value,
+                        cc_pair_id=cc_pair_id,
+                        connector_name=error_connector_name,
+                        in_error=True,
                     )
                     # When entering repeated error state, also pause the connector
                     # to prevent continued indexing retry attempts burning through embedding credits.

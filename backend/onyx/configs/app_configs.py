@@ -286,11 +286,9 @@ USING_AWS_MANAGED_OPENSEARCH = (
     os.environ.get("USING_AWS_MANAGED_OPENSEARCH", "").lower() == "true"
 )
 # Profiling adds some overhead to OpenSearch operations. This overhead is
-# unknown right now. It is enabled by default so we can get useful logs for
-# investigating slow queries. We may never disable it if the overhead is
-# minimal.
+# unknown right now. Defaults to True.
 OPENSEARCH_PROFILING_DISABLED = (
-    os.environ.get("OPENSEARCH_PROFILING_DISABLED", "").lower() == "true"
+    os.environ.get("OPENSEARCH_PROFILING_DISABLED", "true").lower() == "true"
 )
 # Whether to disable match highlights for OpenSearch. Defaults to True for now
 # as we investigate query performance.
@@ -381,6 +379,14 @@ POSTGRES_HOST = os.environ.get("POSTGRES_HOST") or "127.0.0.1"
 POSTGRES_PORT = os.environ.get("POSTGRES_PORT") or "5432"
 POSTGRES_DB = os.environ.get("POSTGRES_DB") or "postgres"
 AWS_REGION_NAME = os.environ.get("AWS_REGION_NAME") or "us-east-2"
+# Comma-separated replica / multi-host list. If unset, defaults to POSTGRES_HOST
+# only.
+_POSTGRES_HOSTS_STR = os.environ.get("POSTGRES_HOSTS", "").strip()
+POSTGRES_HOSTS: list[str] = (
+    [h.strip() for h in _POSTGRES_HOSTS_STR.split(",") if h.strip()]
+    if _POSTGRES_HOSTS_STR
+    else [POSTGRES_HOST]
+)
 
 POSTGRES_API_SERVER_POOL_SIZE = int(
     os.environ.get("POSTGRES_API_SERVER_POOL_SIZE") or 40
@@ -805,6 +811,10 @@ MINI_CHUNK_SIZE = 150
 # This is the number of regular chunks per large chunk
 LARGE_CHUNK_RATIO = 4
 
+# The maximum number of chunks that can be held for 1 document processing batch
+# The purpose of this is to set an upper bound on memory usage
+MAX_CHUNKS_PER_DOC_BATCH = int(os.environ.get("MAX_CHUNKS_PER_DOC_BATCH") or 1000)
+
 # Include the document level metadata in each chunk. If the metadata is too long, then it is thrown out
 # We don't want the metadata to overwhelm the actual contents of the chunk
 SKIP_METADATA_IN_CHUNK = os.environ.get("SKIP_METADATA_IN_CHUNK", "").lower() == "true"
@@ -829,6 +839,29 @@ MAX_DOCUMENT_CHARS = int(os.environ.get("MAX_DOCUMENT_CHARS") or 5_000_000)
 MAX_FILE_SIZE_BYTES = int(
     os.environ.get("MAX_FILE_SIZE_BYTES") or 2 * 1024 * 1024 * 1024
 )  # 2GB in bytes
+
+# Maximum embedded images allowed in a single file. PDFs (and other formats)
+# with thousands of embedded images can OOM the user-file-processing worker
+# because every image is decoded with PIL and then sent to the vision LLM.
+# Enforced both at upload time (rejects the file) and during extraction
+# (defense-in-depth: caps the number of images materialized).
+#
+# Clamped to >= 0; a negative env value would turn upload validation into
+# always-fail and extraction into always-stop, which is never desired. 0
+# disables image extraction entirely, which is a valid (if aggressive) setting.
+MAX_EMBEDDED_IMAGES_PER_FILE = max(
+    0, int(os.environ.get("MAX_EMBEDDED_IMAGES_PER_FILE") or 500)
+)
+
+# Maximum embedded images allowed across all files in a single upload batch.
+# Protects against the scenario where a user uploads many files that each
+# fall under MAX_EMBEDDED_IMAGES_PER_FILE but aggregate to enough work
+# (serial-ish celery fan-out plus per-image vision-LLM calls) to OOM the
+# worker under concurrency or run up surprise latency/cost. Also clamped
+# to >= 0.
+MAX_EMBEDDED_IMAGES_PER_UPLOAD = max(
+    0, int(os.environ.get("MAX_EMBEDDED_IMAGES_PER_UPLOAD") or 1000)
+)
 
 # Use document summary for contextual rag
 USE_DOCUMENT_SUMMARY = os.environ.get("USE_DOCUMENT_SUMMARY", "true").lower() == "true"
@@ -938,8 +971,19 @@ CUSTOM_ANSWER_VALIDITY_CONDITIONS = json.loads(
 )
 
 VESPA_REQUEST_TIMEOUT = int(os.environ.get("VESPA_REQUEST_TIMEOUT") or "15")
+# This is the timeout for the client side of the Vespa migration task. When
+# exceeded, an exception is raised in our code. This value should be higher than
+# VESPA_MIGRATION_SERVER_SIDE_REQUEST_TIMEOUT.
 VESPA_MIGRATION_REQUEST_TIMEOUT_S = int(
     os.environ.get("VESPA_MIGRATION_REQUEST_TIMEOUT_S") or "120"
+)
+# This is the timeout Vespa uses on the server side to know when to wrap up its
+# traversal and try to report partial results. This differs from the client
+# timeout above which raises an exception in our code when exceeded. This
+# timeout allows Vespa to return gracefully. This value should be lower than
+# VESPA_MIGRATION_REQUEST_TIMEOUT_S. Formatted as <number of seconds>s.
+VESPA_MIGRATION_SERVER_SIDE_REQUEST_TIMEOUT = os.environ.get(
+    "VESPA_MIGRATION_SERVER_SIDE_REQUEST_TIMEOUT", "110s"
 )
 
 SYSTEM_RECURSION_LIMIT = int(os.environ.get("SYSTEM_RECURSION_LIMIT") or "1000")
@@ -1075,7 +1119,6 @@ POD_NAMESPACE = os.environ.get("POD_NAMESPACE")
 
 DEV_MODE = os.environ.get("DEV_MODE", "").lower() == "true"
 
-HOOK_ENABLED = os.environ.get("HOOK_ENABLED", "").lower() == "true"
 
 INTEGRATION_TESTS_MODE = os.environ.get("INTEGRATION_TESTS_MODE", "").lower() == "true"
 

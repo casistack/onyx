@@ -9,7 +9,10 @@ from pydantic import ConfigDict
 from pydantic import Field
 from sqlalchemy.orm import Session
 
+from onyx.configs.app_configs import MAX_EMBEDDED_IMAGES_PER_FILE
+from onyx.configs.app_configs import MAX_EMBEDDED_IMAGES_PER_UPLOAD
 from onyx.db.llm import fetch_default_llm_model
+from onyx.file_processing.extract_file_text import count_pdf_embedded_images
 from onyx.file_processing.extract_file_text import extract_file_text
 from onyx.file_processing.extract_file_text import get_file_ext
 from onyx.file_processing.file_types import OnyxFileExtensions
@@ -76,9 +79,16 @@ class CategorizedFiles(BaseModel):
     acceptable: list[UploadFile] = Field(default_factory=list)
     rejected: list[RejectedFile] = Field(default_factory=list)
     acceptable_file_to_token_count: dict[str, int] = Field(default_factory=dict)
+    # Filenames within `acceptable` that should be stored but not indexed.
+    skip_indexing: set[str] = Field(default_factory=set)
 
     # Allow FastAPI UploadFile instances
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+def _skip_token_threshold(extension: str) -> bool:
+    """Return True if this file extension should bypass the token limit."""
+    return extension.lower() in OnyxFileExtensions.TABULAR_EXTENSIONS
 
 
 def _apply_long_side_cap(width: int, height: int, cap: int) -> tuple[int, int]:
@@ -183,6 +193,11 @@ def categorize_uploaded_files(
         token_threshold_k * 1000 if token_threshold_k else None
     )  # 0 → None = no limit
 
+    # Running total of embedded images across PDFs in this batch. Once the
+    # aggregate cap is reached, subsequent PDFs in the same upload are
+    # rejected even if they'd individually fit under MAX_EMBEDDED_IMAGES_PER_FILE.
+    batch_image_total = 0
+
     for upload in files:
         try:
             filename = get_safe_filename(upload)
@@ -245,6 +260,47 @@ def categorize_uploaded_files(
                     )
                     continue
 
+                # Reject PDFs with an unreasonable number of embedded images
+                # (either per-file or accumulated across this upload batch).
+                # A PDF with thousands of embedded images can OOM the
+                # user-file-processing celery worker because every image is
+                # decoded with PIL and then sent to the vision LLM.
+                if extension == ".pdf":
+                    file_cap = MAX_EMBEDDED_IMAGES_PER_FILE
+                    batch_cap = MAX_EMBEDDED_IMAGES_PER_UPLOAD
+                    # Use the larger of the two caps as the short-circuit
+                    # threshold so we get a useful count for both checks.
+                    # count_pdf_embedded_images restores the stream position.
+                    count = count_pdf_embedded_images(
+                        upload.file, max(file_cap, batch_cap)
+                    )
+                    if count > file_cap:
+                        results.rejected.append(
+                            RejectedFile(
+                                filename=filename,
+                                reason=(
+                                    f"PDF contains too many embedded images "
+                                    f"(more than {file_cap}). Try splitting "
+                                    f"the document into smaller files."
+                                ),
+                            )
+                        )
+                        continue
+                    if batch_image_total + count > batch_cap:
+                        results.rejected.append(
+                            RejectedFile(
+                                filename=filename,
+                                reason=(
+                                    f"Upload would exceed the "
+                                    f"{batch_cap}-image limit across all "
+                                    f"files in this batch. Try uploading "
+                                    f"fewer image-heavy files at once."
+                                ),
+                            )
+                        )
+                        continue
+                    batch_image_total += count
+
                 text_content = extract_file_text(
                     file=upload.file,
                     file_name=filename,
@@ -264,7 +320,17 @@ def categorize_uploaded_files(
                 token_count = count_tokens(
                     text_content, tokenizer, token_limit=token_threshold
                 )
-                if token_threshold is not None and token_count > token_threshold:
+                exceeds_threshold = (
+                    token_threshold is not None and token_count > token_threshold
+                )
+                if exceeds_threshold and _skip_token_threshold(extension):
+                    # Exempt extensions (e.g. spreadsheets) are accepted
+                    # but flagged to skip indexing — only metadata is
+                    # injected into the LLM context.
+                    results.acceptable.append(upload)
+                    results.acceptable_file_to_token_count[filename] = token_count
+                    results.skip_indexing.add(filename)
+                elif exceeds_threshold:
                     results.rejected.append(
                         RejectedFile(
                             filename=filename,

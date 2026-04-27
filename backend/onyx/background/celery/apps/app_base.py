@@ -10,6 +10,7 @@ from celery import bootsteps  # type: ignore
 from celery import Task
 from celery.app import trace
 from celery.exceptions import WorkerShutdown
+from celery.signals import before_task_publish
 from celery.signals import task_postrun
 from celery.signals import task_prerun
 from celery.states import READY_STATES
@@ -20,6 +21,7 @@ from sentry_sdk.integrations.celery import CeleryIntegration
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from onyx import __version__
 from onyx.background.celery.apps.task_formatters import CeleryTaskColoredFormatter
 from onyx.background.celery.apps.task_formatters import CeleryTaskPlainFormatter
 from onyx.background.celery.celery_utils import celery_is_worker_primary
@@ -65,6 +67,7 @@ if SENTRY_DSN:
         dsn=SENTRY_DSN,
         integrations=[CeleryIntegration()],
         traces_sample_rate=0.1,
+        release=__version__,
     )
     logger.info("Sentry initialized")
 else:
@@ -90,6 +93,17 @@ class TenantAwareTask(Task):
             # Clear or reset after the task runs
             # so it does not leak into any subsequent tasks on the same worker process
             CURRENT_TENANT_ID_CONTEXTVAR.set(None)
+
+
+@before_task_publish.connect
+def on_before_task_publish(
+    headers: dict[str, Any] | None = None,
+    **kwargs: Any,  # noqa: ARG001
+) -> None:
+    """Stamp the current wall-clock time into the task message headers so that
+    workers can compute queue wait time (time between publish and execution)."""
+    if headers is not None:
+        headers["enqueued_at"] = time.time()
 
 
 @task_prerun.connect
@@ -515,7 +529,8 @@ def reset_tenant_id(
 
 
 def wait_for_vespa_or_shutdown(
-    sender: Any, **kwargs: Any  # noqa: ARG001
+    sender: Any,  # noqa: ARG001
+    **kwargs: Any,  # noqa: ARG001
 ) -> None:  # noqa: ARG001
     """Waits for Vespa to become ready subject to a timeout.
     Raises WorkerShutdown if the timeout is reached."""
