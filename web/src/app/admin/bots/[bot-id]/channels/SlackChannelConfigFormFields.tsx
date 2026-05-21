@@ -11,7 +11,7 @@ import {
   TextArrayField,
   TextFormField,
 } from "@/components/Field";
-import { Button } from "@opal/components";
+import { Button, Divider } from "@opal/components";
 import { MinimalPersonaSnapshot } from "@/app/admin/agents/interfaces";
 import DocumentSetCard from "@/sections/cards/DocumentSetCard";
 import CollapsibleSection from "@/app/admin/agents/CollapsibleSection";
@@ -23,12 +23,7 @@ import { RadioGroupItemField } from "@/components/ui/RadioGroupItemField";
 import { AlertCircle } from "lucide-react";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { TooltipProvider } from "@radix-ui/react-tooltip";
+import { Tooltip } from "@opal/components";
 import { SourceIcon } from "@/components/SourceIcon";
 import Link from "next/link";
 import AgentAvatar from "@/refresh-components/avatars/AgentAvatar";
@@ -39,7 +34,6 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import Separator from "@/refresh-components/Separator";
 import { CheckboxField } from "@/refresh-components/form/LabeledCheckboxField";
 
 export interface SlackChannelConfigFormFieldsProps {
@@ -452,7 +446,7 @@ export function SlackChannelConfigFormFields({
           </div>
         )}
       </div>
-      <Separator className="my-4" />
+      <Divider />
       <Accordion type="multiple" className="gap-y-2 w-full">
         {values.knowledge_source !== "non_search_agent" && (
           <AccordionItem value="search-options">
@@ -550,11 +544,18 @@ export function SlackChannelConfigFormFields({
                 name="respond_member_group_list"
                 label="(Optional) Respond to Certain Users / Groups"
                 subtext={
-                  "If specified, OnyxBot responses will only " +
-                  "be visible to the members or groups in this list."
+                  "If specified, only these users / groups can invoke " +
+                  "OnyxBot in this channel, and responses are visible only " +
+                  "to them."
                 }
                 values={values}
                 placeholder="User email or user group name..."
+                disabled={values.is_ephemeral}
+                tooltip={
+                  values.is_ephemeral
+                    ? "Disabled while 'Respond to user in a private (ephemeral) message' is on — ephemeral responses target a single user only."
+                    : undefined
+                }
               />
 
               <StandardAnswerCategoryDropdownField
@@ -571,14 +572,10 @@ export function SlackChannelConfigFormFields({
 
       <div className="flex mt-8 gap-x-2 w-full justify-end">
         {shouldShowPrivacyAlert && (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div className="flex hover:bg-background-150 cursor-pointer p-2 rounded-lg items-center">
-                  <AlertCircle className="h-5 w-5 text-alert" />
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="bg-background p-4 w-80">
+          <Tooltip
+            side="top"
+            tooltip={
+              <div className="space-y-2">
                 <Label className="text-text mb-2 font-semibold">
                   Privacy Alert
                 </Label>
@@ -616,9 +613,13 @@ export function SlackChannelConfigFormFields({
                     ))}
                   </div>
                 </div>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+              </div>
+            }
+          >
+            <div className="flex hover:bg-background-150 cursor-pointer p-2 rounded-lg items-center">
+              <AlertCircle className="h-5 w-5 text-alert" />
+            </div>
+          </Tooltip>
         )}
         <Button type="submit">{isUpdate ? "Update" : "Create"}</Button>
         <Button prominence="secondary" onClick={() => router.back()}>

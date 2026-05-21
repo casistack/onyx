@@ -15,6 +15,7 @@ from onyx.configs.constants import OnyxCeleryTask
 from onyx.configs.constants import OnyxRedisConstants
 from onyx.db.document import construct_document_id_select_by_needs_sync
 from onyx.db.document import count_documents_by_needs_sync
+from onyx.redis.redis_tenant_work_gating import maybe_mark_tenant_active
 from onyx.utils.logger import setup_logger
 
 # Redis keys for document sync tracking
@@ -116,7 +117,7 @@ def generate_document_sync_tasks(
 
         # Create the Celery task
         celery_app.send_task(
-            OnyxCeleryTask.VESPA_METADATA_SYNC_TASK,
+            OnyxCeleryTask.DOCUMENT_INDEX_METADATA_SYNC_TASK,
             kwargs=dict(document_id=doc_id, tenant_id=tenant_id),
             queue=OnyxCeleryQueues.VESPA_METADATA_SYNC,
             task_id=custom_task_id,
@@ -149,6 +150,10 @@ def try_generate_stale_document_sync_tasks(
     if stale_doc_count == 0:
         logger.info("No stale documents found. Skipping sync tasks generation.")
         return None
+
+    # Tenant-work-gating hook: refresh this tenant's active-set membership
+    # whenever vespa sync actually has stale docs to dispatch.
+    maybe_mark_tenant_active(tenant_id, caller="vespa_sync")
 
     logger.info(
         f"Stale documents found (at least {stale_doc_count}). Generating sync tasks in one batch."

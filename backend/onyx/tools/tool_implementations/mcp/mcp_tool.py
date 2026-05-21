@@ -35,7 +35,9 @@ def _build_llm_tool_name(server_name: str, tool_name: str) -> str:
     if len(sanitized_name) <= _MAX_LLM_TOOL_NAME_LENGTH:
         return sanitized_name
 
-    digest = hashlib.sha1(f"{server_name}:{tool_name}".encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(
+        f"{server_name}:{tool_name}".encode("utf-8")
+    ).hexdigest()[:12]
     prefix_length = _MAX_LLM_TOOL_NAME_LENGTH - len(digest) - 1
     truncated_prefix = sanitized_name[:prefix_length].rstrip("_")
     if not truncated_prefix:
@@ -56,6 +58,18 @@ DENYLISTED_MCP_HEADERS = {
 #     server_url: str
 #     tool_result: Any
 #     server_name: str
+
+
+def _normalize_parameters_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
+    # Azure OpenAI rejects object schemas that omit `properties` with
+    # "object schema missing properties". MCP servers (e.g. AWS Knowledge MCP's
+    # aws___list_regions) may legally return `{"type": "object"}` with no
+    # properties for zero-arg tools, so seed `properties: {}` ourselves.
+    if not schema:
+        return {"type": "object", "properties": {}}
+    if schema.get("type", "object") == "object" and "properties" not in schema:
+        return {**schema, "type": "object", "properties": {}}
+    return schema
 
 
 class MCPTool(Tool[None]):
@@ -119,7 +133,7 @@ class MCPTool(Tool[None]):
             "function": {
                 "name": self.llm_name,
                 "description": self._description,
-                "parameters": self._tool_definition,
+                "parameters": _normalize_parameters_schema(self._tool_definition),
             },
         }
 
@@ -239,8 +253,8 @@ class MCPTool(Tool[None]):
                         f"Re-authentication may be required after token expiry."
                     )
                 else:
-                    from onyx.server.features.mcp.api import UNUSED_RETURN_PATH
                     from onyx.server.features.mcp.api import make_oauth_provider
+                    from onyx.server.features.mcp.api import UNUSED_RETURN_PATH
 
                     # user_id is the requesting user's UUID; safe here because
                     # UNUSED_RETURN_PATH ensures redirect_handler raises immediately

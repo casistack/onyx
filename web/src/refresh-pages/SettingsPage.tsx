@@ -2,9 +2,14 @@
 
 import { useRef, useCallback, useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import * as InputLayouts from "@/layouts/input-layouts";
 import { Section, AttachmentItemLayout } from "@/layouts/general-layouts";
-import { Content, ContentAction } from "@opal/layouts";
+import {
+  Content,
+  ContentAction,
+  InputHorizontal,
+  InputVertical,
+} from "@opal/layouts";
+import { markdown } from "@opal/utils";
 import { Formik, Form } from "formik";
 import * as Yup from "yup";
 import {
@@ -36,12 +41,11 @@ import { SWR_KEYS } from "@/lib/swr-keys";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 import useFilter from "@/hooks/useFilter";
 import CreateButton from "@/refresh-components/buttons/CreateButton";
-import { Button } from "@opal/components";
+import { Button, Divider } from "@opal/components";
 import useFederatedOAuthStatus from "@/hooks/useFederatedOAuthStatus";
 import useCCPairs from "@/hooks/useCCPairs";
 import { ValidSources } from "@/lib/types";
 import { ConnectorCredentialPairStatus } from "@/app/admin/connector/[ccPairId]/types";
-import Separator from "@/refresh-components/Separator";
 import Text from "@/refresh-components/texts/Text";
 import ConfirmationModalLayout from "@/refresh-components/layouts/ConfirmationModalLayout";
 import Code from "@/refresh-components/Code";
@@ -49,7 +53,7 @@ import CharacterCount from "@/refresh-components/CharacterCount";
 import { InputPrompt } from "@/app/app/interfaces";
 import usePromptShortcuts from "@/hooks/usePromptShortcuts";
 import ColorSwatch from "@/refresh-components/ColorSwatch";
-import EmptyMessage from "@/refresh-components/EmptyMessage";
+import { EmptyMessageCard } from "@opal/components";
 import Memories from "@/sections/settings/Memories";
 import { FederatedConnectorOAuthStatus } from "@/components/chat/FederatedOAuthModal";
 import {
@@ -57,11 +61,11 @@ import {
   CHAT_BACKGROUND_NONE,
 } from "@/lib/constants/chatBackgrounds";
 import { SvgCheck } from "@opal/icons";
-import { cn } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import { Interactive } from "@opal/core";
 import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
 import { useSettingsContext } from "@/providers/SettingsProvider";
-import SimpleTooltip from "@/refresh-components/SimpleTooltip";
+import { Tooltip } from "@opal/components";
 import { useCloudSubscription } from "@/hooks/useCloudSubscription";
 import { useSmoothStreaming } from "@/hooks/useSmoothStreaming";
 
@@ -124,12 +128,12 @@ function PATModal({
       <Section gap={1}>
         {/* Token Creation*/}
         {!!createdToken?.token ? (
-          <InputLayouts.Vertical title="Token Value">
+          <InputVertical title="Token Value" withLabel>
             <Code>{createdToken.token}</Code>
-          </InputLayouts.Vertical>
+          </InputVertical>
         ) : (
           <>
-            <InputLayouts.Vertical title="Token Name">
+            <InputVertical title="Token Name" withLabel>
               <InputTypeIn
                 placeholder="Name your token"
                 value={newTokenName}
@@ -137,8 +141,8 @@ function PATModal({
                 variant={isCreating ? "disabled" : undefined}
                 autoComplete="new-password"
               />
-            </InputLayouts.Vertical>
-            <InputLayouts.Vertical
+            </InputVertical>
+            <InputVertical
               title="Expires in"
               subDescription={
                 expirationDays === "null"
@@ -155,6 +159,7 @@ function PATModal({
                         .replace(".999Z", " UTC")}`;
                     })()
               }
+              withLabel
             >
               <InputSelect
                 value={expirationDays}
@@ -171,7 +176,7 @@ function PATModal({
                   </InputSelect.Item>
                 </InputSelect.Content>
               </InputSelect>
-            </InputLayouts.Vertical>
+            </InputVertical>
           </>
         )}
       </Section>
@@ -187,6 +192,24 @@ function GeneralSettings() {
     updateUserChatBackground,
   } = useUser();
   const { theme, setTheme, systemTheme } = useTheme();
+
+  const applyBackground = useCallback(
+    async (bg: (typeof CHAT_BACKGROUND_OPTIONS)[number]) => {
+      try {
+        await updateUserChatBackground(
+          bg.id === CHAT_BACKGROUND_NONE ? null : bg.id
+        );
+        if (bg.theme) {
+          setTheme(bg.theme);
+          await updateUserThemePreference(bg.theme);
+        }
+      } catch {
+        // errors are already logged and state is rolled back via refreshUser
+        // inside the update functions
+      }
+    },
+    [updateUserChatBackground, setTheme, updateUserThemePreference]
+  );
   const { refreshChatSessions } = useChatSessions();
   const router = useRouter();
   const pathname = usePathname();
@@ -265,13 +288,14 @@ function GeneralSettings() {
             title="Profile"
             sizePreset="main-content"
             variant="section"
-            widthVariant="full"
+            width="full"
           />
           <Card>
-            <InputLayouts.Horizontal
+            <InputHorizontal
               title="Full Name"
               description="We'll display this name in the app."
               center
+              withLabel
             >
               <InputTypeIn
                 placeholder="Your name"
@@ -292,11 +316,12 @@ function GeneralSettings() {
                   }
                 }}
               />
-            </InputLayouts.Horizontal>
-            <InputLayouts.Horizontal
+            </InputHorizontal>
+            <InputHorizontal
               title="Work Role"
               description="Share your role to better tailor responses."
               center
+              withLabel
             >
               <InputTypeIn
                 placeholder="Your role"
@@ -317,7 +342,7 @@ function GeneralSettings() {
                   }
                 }}
               />
-            </InputLayouts.Horizontal>
+            </InputHorizontal>
           </Card>
         </Section>
 
@@ -326,13 +351,14 @@ function GeneralSettings() {
             title="Appearance"
             sizePreset="main-content"
             variant="section"
-            widthVariant="full"
+            width="full"
           />
           <Card>
-            <InputLayouts.Horizontal
+            <InputHorizontal
               title="Color Mode"
               description="Select your preferred color mode for the UI."
               center
+              withLabel
             >
               <InputSelect
                 value={theme}
@@ -375,8 +401,8 @@ function GeneralSettings() {
                   </InputSelect.Item>
                 </InputSelect.Content>
               </InputSelect>
-            </InputLayouts.Horizontal>
-            <InputLayouts.Vertical title="Chat Background">
+            </InputHorizontal>
+            <InputVertical title="Chat Background">
               <div className="flex flex-wrap gap-2">
                 {CHAT_BACKGROUND_OPTIONS.map((bg) => {
                   const currentBackgroundId =
@@ -387,11 +413,7 @@ function GeneralSettings() {
                   return (
                     <button
                       key={bg.id}
-                      onClick={() =>
-                        updateUserChatBackground(
-                          bg.id === CHAT_BACKGROUND_NONE ? null : bg.id
-                        )
-                      }
+                      onClick={() => applyBackground(bg)}
                       className="relative overflow-hidden rounded-lg transition-all w-[90px] h-[68px] cursor-pointer border-none p-0 bg-transparent group"
                       title={bg.label}
                       aria-label={`${bg.label} background${
@@ -425,21 +447,21 @@ function GeneralSettings() {
                   );
                 })}
               </div>
-            </InputLayouts.Vertical>
+            </InputVertical>
           </Card>
         </Section>
 
-        <Separator noPadding />
+        <Divider paddingParallel="fit" paddingPerpendicular="fit" />
 
         <Section gap={0.75}>
           <Content
             title="Danger Zone"
             sizePreset="main-content"
             variant="section"
-            widthVariant="full"
+            width="full"
           />
           <Card>
-            <InputLayouts.Horizontal
+            <InputHorizontal
               title="Delete All Chats"
               description="Permanently delete all your chat sessions."
               center
@@ -453,7 +475,7 @@ function GeneralSettings() {
               >
                 Delete All Chats
               </Button>
-            </InputLayouts.Horizontal>
+            </InputHorizontal>
           </Card>
         </Section>
       </Section>
@@ -828,12 +850,13 @@ function ChatPreferencesSettings() {
           title="Chats"
           sizePreset="main-content"
           variant="section"
-          widthVariant="full"
+          width="full"
         />
         <Card>
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Default Model"
             description="This model will be used by Onyx by default in your chats."
+            withLabel
           >
             <LLMPopover
               llmManager={llmManager}
@@ -841,11 +864,12 @@ function ChatPreferencesSettings() {
                 void updateUserDefaultModel(selected);
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Chat Auto-scroll"
             description="Automatically scroll to new content as chat generates response."
+            withLabel
           >
             <Switch
               checked={user?.preferences.auto_scroll}
@@ -853,20 +877,21 @@ function ChatPreferencesSettings() {
                 updateUserAutoScroll(checked);
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Smooth Streaming"
             description="Animate streamed responses character-by-character. Disable to render chunks as they arrive."
+            withLabel
           >
             <Switch
               checked={smoothStreamingEnabled}
               onCheckedChange={setSmoothStreamingEnabled}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
           {isPaidEnterpriseFeaturesEnabled && (
-            <SimpleTooltip
+            <Tooltip
               tooltip={
                 searchUiEnabled
                   ? undefined
@@ -874,11 +899,12 @@ function ChatPreferencesSettings() {
               }
               side="top"
             >
-              <InputLayouts.Horizontal
+              <InputHorizontal
                 title="Default App Mode"
                 description="Choose whether new sessions start in Search or Chat mode."
                 center
                 disabled={!searchUiEnabled}
+                withLabel
               >
                 <InputSelect
                   value={user?.preferences.default_app_mode ?? "CHAT"}
@@ -893,16 +919,17 @@ function ChatPreferencesSettings() {
                     <InputSelect.Item value="SEARCH">Search</InputSelect.Item>
                   </InputSelect.Content>
                 </InputSelect>
-              </InputLayouts.Horizontal>
-            </SimpleTooltip>
+              </InputHorizontal>
+            </Tooltip>
           )}
         </Card>
       </Section>
 
       <Section gap={0.75}>
-        <InputLayouts.Vertical
+        <InputVertical
           title="Personal Preferences"
           description="Provide your custom preferences in natural language."
+          withLabel
         >
           <InputTextArea
             placeholder="Describe how you want the system to behave and the tone it should use."
@@ -918,17 +945,18 @@ function ChatPreferencesSettings() {
             value={personalizationValues.user_preferences || ""}
             limit={500}
           />
-        </InputLayouts.Vertical>
+        </InputVertical>
         <Content
           title="Memory"
           sizePreset="main-content"
           variant="section"
-          widthVariant="full"
+          width="full"
         />
         <Card>
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Reference Stored Memories"
             description="Let Onyx reference stored memories in chats."
+            withLabel
           >
             <Switch
               checked={personalizationValues.use_memories}
@@ -937,10 +965,11 @@ function ChatPreferencesSettings() {
                 void handleSavePersonalization({ use_memories: checked });
               }}
             />
-          </InputLayouts.Horizontal>
-          <InputLayouts.Horizontal
+          </InputHorizontal>
+          <InputHorizontal
             title="Update Memories"
             description="Let Onyx generate and update stored memories."
+            withLabel
           >
             <Switch
               checked={personalizationValues.enable_memory_tool}
@@ -951,7 +980,7 @@ function ChatPreferencesSettings() {
                 });
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
           {(personalizationValues.use_memories ||
             personalizationValues.enable_memory_tool ||
@@ -969,12 +998,13 @@ function ChatPreferencesSettings() {
           title="Prompt Shortcuts"
           sizePreset="main-content"
           variant="section"
-          widthVariant="full"
+          width="full"
         />
         <Card>
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Use Prompt Shortcuts"
             description="Enable shortcuts to quickly insert common prompts."
+            withLabel
           >
             <Switch
               checked={user?.preferences?.shortcut_enabled}
@@ -982,7 +1012,7 @@ function ChatPreferencesSettings() {
                 updateUserShortcuts(checked);
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
           {user?.preferences?.shortcut_enabled && <PromptShortcuts />}
         </Card>
@@ -993,12 +1023,13 @@ function ChatPreferencesSettings() {
           title="Voice"
           sizePreset="main-content"
           variant="section"
-          widthVariant="full"
+          width="full"
         />
         <Card>
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Auto-Send on Pause"
             description="Automatically send voice input when you stop speaking."
+            withLabel
           >
             <Switch
               checked={user?.preferences.voice_auto_send ?? false}
@@ -1006,11 +1037,12 @@ function ChatPreferencesSettings() {
                 void saveVoiceSettings({ auto_send: checked });
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Auto-Playback"
             description="Automatically play voice responses."
+            withLabel
           >
             <Switch
               checked={user?.preferences.voice_auto_playback ?? false}
@@ -1018,11 +1050,12 @@ function ChatPreferencesSettings() {
                 void saveVoiceSettings({ auto_playback: checked });
               }}
             />
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
 
-          <InputLayouts.Horizontal
+          <InputHorizontal
             title="Playback Speed"
             description="Adjust the speed of voice playback."
+            withLabel
           >
             <div className="flex items-center gap-3">
               <input
@@ -1047,7 +1080,7 @@ function ChatPreferencesSettings() {
                 {draftVoicePlaybackSpeed.toFixed(1)}x
               </span>
             </div>
-          </InputLayouts.Horizontal>
+          </InputHorizontal>
         </Card>
       </Section>
     </Section>
@@ -1307,8 +1340,8 @@ function AccountsAccessSettings() {
               >
                 <Section gap={1}>
                   <Section gap={0.25} alignItems="start">
-                    <InputLayouts.Vertical
-                      name="currentPassword"
+                    <InputVertical
+                      withLabel="currentPassword"
                       title="Current Password"
                     >
                       <PasswordInputTypeIn
@@ -1320,13 +1353,10 @@ function AccountsAccessSettings() {
                           touched.currentPassword && !!errors.currentPassword
                         }
                       />
-                    </InputLayouts.Vertical>
+                    </InputVertical>
                   </Section>
                   <Section gap={0.25} alignItems="start">
-                    <InputLayouts.Vertical
-                      name="newPassword"
-                      title="New Password"
-                    >
+                    <InputVertical withLabel="newPassword" title="New Password">
                       <PasswordInputTypeIn
                         name="newPassword"
                         value={values.newPassword}
@@ -1334,11 +1364,11 @@ function AccountsAccessSettings() {
                         onBlur={handleBlur}
                         error={touched.newPassword && !!errors.newPassword}
                       />
-                    </InputLayouts.Vertical>
+                    </InputVertical>
                   </Section>
                   <Section gap={0.25} alignItems="start">
-                    <InputLayouts.Vertical
-                      name="confirmPassword"
+                    <InputVertical
+                      withLabel="confirmPassword"
                       title="Confirm New Password"
                     >
                       <PasswordInputTypeIn
@@ -1350,7 +1380,7 @@ function AccountsAccessSettings() {
                           touched.confirmPassword && !!errors.confirmPassword
                         }
                       />
-                    </InputLayouts.Vertical>
+                    </InputVertical>
                   </Section>
                 </Section>
               </ConfirmationModalLayout>
@@ -1365,20 +1395,19 @@ function AccountsAccessSettings() {
             title="Accounts"
             sizePreset="main-content"
             variant="section"
-            widthVariant="full"
+            width="full"
           />
           <Card>
-            <InputLayouts.Horizontal
+            <InputHorizontal
               title="Email"
               description="Your account email address."
               center
-              nonInteractive
             >
               <Text>{user?.email ?? "anonymous"}</Text>
-            </InputLayouts.Horizontal>
+            </InputHorizontal>
 
             {showPasswordSection && (
-              <InputLayouts.Horizontal
+              <InputHorizontal
                 title="Password"
                 description="Update your account password."
                 center
@@ -1391,7 +1420,7 @@ function AccountsAccessSettings() {
                 >
                   Change Password
                 </Button>
-              </InputLayouts.Horizontal>
+              </InputHorizontal>
             )}
           </Card>
         </Section>
@@ -1402,7 +1431,7 @@ function AccountsAccessSettings() {
               title="Access Tokens"
               sizePreset="main-content"
               variant="section"
-              widthVariant="full"
+              width="full"
             />
             {canCreateTokens ? (
               <Card padding={0.25}>
@@ -1464,8 +1493,8 @@ function AccountsAccessSettings() {
                       return (
                         <Interactive.Container
                           key={pat.id}
-                          heightVariant="fit"
-                          widthVariant="full"
+                          size="fit"
+                          width="full"
                         >
                           <div className="w-full bg-background-tint-01">
                             <AttachmentItemLayout
@@ -1571,7 +1600,7 @@ function FederatedConnectorCard({
       {showDisconnectConfirmation && (
         <ConfirmationModalLayout
           icon={SvgUnplug}
-          title={`Disconnect ${sourceMetadata.displayName}`}
+          title={markdown(`Disconnect *${sourceMetadata.displayName}*`)}
           onClose={() => setShowDisconnectConfirmation(false)}
           submit={
             <Button
@@ -1606,7 +1635,7 @@ function FederatedConnectorCard({
           }
           sizePreset="main-content"
           variant="section"
-          paddingVariant="sm"
+          padding="sm"
           rightChildren={
             connector.has_oauth_token ? (
               <Button
@@ -1679,7 +1708,7 @@ function ConnectorsSettings() {
           title="Connectors"
           sizePreset="main-content"
           variant="section"
-          widthVariant="full"
+          width="full"
         />
         {hasConnectors ? (
           <>
@@ -1702,7 +1731,10 @@ function ConnectorsSettings() {
             ))}
           </>
         ) : (
-          <EmptyMessage title="No connectors set up for your organization." />
+          <EmptyMessageCard
+            sizePreset="main-ui"
+            title="No connectors set up for your organization."
+          />
         )}
       </Section>
     </Section>

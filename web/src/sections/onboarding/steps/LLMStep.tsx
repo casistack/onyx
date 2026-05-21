@@ -2,8 +2,7 @@
 
 import { memo, useState, useCallback } from "react";
 import Text from "@/refresh-components/texts/Text";
-import { Button } from "@opal/components";
-import Separator from "@/refresh-components/Separator";
+import { Button, Divider } from "@opal/components";
 import LLMProviderCard from "@/sections/onboarding/components/LLMProviderCard";
 import {
   OnboardingActions,
@@ -16,7 +15,7 @@ import {
 } from "@/interfaces/llm";
 import { getProvider } from "@/lib/llmConfig";
 import { Disabled } from "@opal/core";
-import ModelIcon from "@/app/admin/configuration/llm/ModelIcon";
+import ModelIcon from "@/app/admin/configuration/language-models/ModelIcon";
 import { SvgCheckCircle, SvgCpu, SvgExternalLink } from "@opal/icons";
 import { ContentAction } from "@opal/layouts";
 import { useLLMProviderOptions } from "@/lib/hooks/useLLMProviderOptions";
@@ -157,19 +156,19 @@ const LLMStep = memo(
               description="Onyx supports both self-hosted models and popular providers."
               sizePreset="main-ui"
               variant="section"
-              paddingVariant="lg"
+              padding="lg"
               rightChildren={
                 <Button
                   disabled={disabled}
                   prominence="tertiary"
                   rightIcon={SvgExternalLink}
-                  href="/admin/configuration/llm"
+                  href="/admin/configuration/language-models"
                 >
                   View in Admin Panel
                 </Button>
               }
             />
-            <Separator />
+            <Divider />
             <div className="flex flex-wrap gap-1 [&>*:last-child:nth-child(odd)]:basis-full">
               {isLoading ? (
                 Array.from({ length: 8 }).map((_, idx) => (

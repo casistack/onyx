@@ -18,9 +18,9 @@ from onyx.db.models import ChatMessage
 from onyx.db.models import ChatSession
 from onyx.db.models import ChatSessionSharedStatus
 from onyx.db.models import Connector
+from onyx.db.models import Document
 from onyx.db.models import DocumentByConnectorCredentialPair
 from onyx.db.models import FileRecord
-from onyx.db.models import Persona
 from onyx.db.models import User
 from onyx.db.models import UserFile
 from onyx.db.user_file import fetch_user_files_with_access_relationships
@@ -214,7 +214,6 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
     JSONB scan in `_documents_from_file_connector_config`):
 
     - `UserFile` owned by the user.
-    - `Persona.uploaded_image_id` (avatars are public to authenticated users).
     - `ChatMessage.files` of a session the user owns or that is shared as
       `ChatSessionSharedStatus.PUBLIC`.
     - `FileRecord` with origin `CHAT_IMAGE_GEN` (see inline TODO).
@@ -230,22 +229,6 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
         .exists()
     ).scalar()
     if owns_user_file:
-        return True
-
-    # TODO: move persona avatars to a dedicated endpoint so this branch
-    # can go away. Restrict to CHAT_UPLOAD-origin for now so an attacker
-    # cannot bind another user's USER_FILE to their persona and read it
-    # through this check.
-    is_persona_avatar = db_session.query(
-        select(Persona.id)
-        .join(FileRecord, FileRecord.file_id == Persona.uploaded_image_id)
-        .where(
-            Persona.uploaded_image_id == file_id,
-            FileRecord.file_origin == FileOrigin.CHAT_UPLOAD,
-        )
-        .exists()
-    ).scalar()
-    if is_persona_avatar:
         return True
 
     chat_file_stmt = (
@@ -287,15 +270,25 @@ def _user_can_access_connector_file(
     """Mirror retrieval-time ACL: grant access if any `Document` referencing
     `file_id` has an ACL the user satisfies.
 
-    v3.1 covers only File-connector uploads via
-    `Connector.connector_specific_config['file_locations']`. Other connector
-    files (Google Drive / SharePoint / Confluence images) have no
-    Postgres-level linkage from `file_id` to a document on this branch
-    (`Document.file_id` does not exist until #10299), so previews of those
-    still fail closed. Documents under one cc_pair share its ACL, so any
-    one representative document answers the question.
+    Two lookup paths:
+    1. `Document.file_id == file_id` — fast path; set by most connectors
+       and by tabular File-connector uploads.
+    2. `Connector.connector_specific_config['file_locations']` — fallback
+       for non-tabular File-connector uploads (which leave
+       `Document.file_id=NULL`). Documents under one cc_pair share its
+       ACL, so any one representative document answers the question.
+
+    `FileRecord.file_origin` is deliberately not consulted: the stamp has
+    varied across releases and any origin filter would either miss legacy
+    files or sprawl.
     """
-    document_ids = _documents_from_file_connector_config(file_id, db_session)
+    document_ids: list[str] = list(
+        db_session.execute(select(Document.id).where(Document.file_id == file_id))
+        .scalars()
+        .all()
+    )
+    if not document_ids:
+        document_ids = _documents_from_file_connector_config(file_id, db_session)
     if not document_ids:
         return False
 
@@ -317,7 +310,12 @@ def _documents_from_file_connector_config(
     via one credential must not be denied because we sampled a doc from
     another.
 
-    The `@>` lookup can't use a btree index, so every call is a JSONB scan.
+    TODO(delete-me): exists only because the File connector leaves
+    `Document.file_id=NULL` for non-tabular uploads (see comment in
+    `onyx/connectors/file/connector.py`). The `@>` lookup also can't use
+    a btree index, so every fast-path miss does a JSONB scan. Once the
+    connector stamps `Document.file_id` unconditionally and a backfill
+    runs, this helper and its caller branch can go away.
     """
     cc_pair_keys = db_session.execute(
         select(

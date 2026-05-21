@@ -28,7 +28,7 @@ import {
 } from "@opal/icons";
 import Switch from "@/refresh-components/inputs/Switch";
 import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
-import SimpleTooltip from "@/refresh-components/SimpleTooltip";
+import { Tooltip } from "@opal/components";
 import { ConfirmEntityModal } from "@/components/modals/ConfirmEntityModal";
 import IconButton from "@/refresh-components/buttons/IconButton";
 
@@ -556,7 +556,7 @@ function LibraryTreeView({
               </Section>
 
               {/* Sync toggle */}
-              <SimpleTooltip
+              <Tooltip
                 tooltip={
                   entry.sync_enabled
                     ? "Synced to sandbox - click to disable"
@@ -567,7 +567,7 @@ function LibraryTreeView({
                   checked={entry.sync_enabled}
                   onCheckedChange={(checked) => onToggleSync(entry, checked)}
                 />
-              </SimpleTooltip>
+              </Tooltip>
             </Section>
 
             {/* Children */}

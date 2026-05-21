@@ -18,7 +18,6 @@ import {
   SvgHistory,
   SvgImage,
   SvgMcp,
-  SvgNetworkGraph,
   SvgOnyxOctagon,
   SvgPaintBrush,
   SvgProgressBars,
@@ -127,7 +126,7 @@ export const ADMIN_ROUTES = {
     sidebarLabel: "Chat Preferences",
   },
   LLM_MODELS: {
-    path: "/admin/configuration/llm",
+    path: "/admin/configuration/language-models",
     icon: SvgCpu,
     title: "Language Models",
     sidebarLabel: "Language Models",
@@ -167,12 +166,6 @@ export const ADMIN_ROUTES = {
     icon: SvgFileText,
     title: "Document Processing",
     sidebarLabel: "Document Processing",
-  },
-  KNOWLEDGE_GRAPH: {
-    path: "/admin/kg",
-    icon: SvgNetworkGraph,
-    title: "Knowledge Graph",
-    sidebarLabel: "Knowledge Graph",
   },
   USERS: {
     path: "/admin/users",

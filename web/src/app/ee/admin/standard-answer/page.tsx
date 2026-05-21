@@ -5,7 +5,7 @@ import { toast } from "@/hooks/useToast";
 import { useStandardAnswers, useStandardAnswerCategories } from "./hooks";
 import { ThreeDotsLoader } from "@/components/Loading";
 import { ErrorCallout } from "@/components/ErrorCallout";
-import Separator from "@/refresh-components/Separator";
+import { Divider } from "@opal/components";
 import {
   Table,
   TableHead,
@@ -407,7 +407,7 @@ function Main() {
         New Standard Answer
       </CreateButton>
 
-      <Separator />
+      <Divider />
 
       <div>
         <StandardAnswersTable
@@ -423,7 +423,7 @@ function Main() {
 export default function Page() {
   return (
     <SettingsLayouts.Root>
-      <SettingsLayouts.Header icon={route.icon} title={route.title} separator />
+      <SettingsLayouts.Header icon={route.icon} title={route.title} divider />
       <SettingsLayouts.Body>
         <Main />
       </SettingsLayouts.Body>

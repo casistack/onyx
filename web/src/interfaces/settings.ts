@@ -74,6 +74,7 @@ export interface Settings {
   max_allowed_upload_size_mb?: number;
 
   // Factory defaults for the restore button.
+  default_pruning_freq?: number;
   default_user_file_max_upload_size_mb?: number;
   default_file_token_count_threshold_k?: number;
 }
@@ -85,6 +86,7 @@ export enum NotificationType {
   ASSISTANT_FILES_READY = "assistant_files_ready",
   RELEASE_NOTES = "release_notes",
   FEATURE_ANNOUNCEMENT = "feature_announcement",
+  LICENSE_EXPIRY_WARNING = "license_expiry_warning",
 }
 
 export interface Notification {

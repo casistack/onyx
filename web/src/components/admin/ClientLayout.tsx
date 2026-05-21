@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useSettingsContext } from "@/providers/SettingsProvider";
 import { ApplicationStatus } from "@/interfaces/settings";
 import { Button } from "@opal/components";
-import { cn } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import { ADMIN_ROUTES } from "@/lib/admin-routes";
 import useScreenSize from "@/hooks/useScreenSize";
 import { SvgSidebar } from "@opal/icons";
@@ -42,7 +42,6 @@ const SETTINGS_LAYOUT_PREFIXES = [
   ADMIN_ROUTES.INDEXING_STATUS.path,
   ADMIN_ROUTES.DOCUMENTS.path,
   ADMIN_ROUTES.DEBUG.path,
-  ADMIN_ROUTES.KNOWLEDGE_GRAPH.path,
   ADMIN_ROUTES.SLACK_BOTS.path,
   ADMIN_ROUTES.STANDARD_ANSWERS.path,
   ADMIN_ROUTES.GROUPS.path,

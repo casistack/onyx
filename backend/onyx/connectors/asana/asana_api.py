@@ -3,7 +3,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from typing import Dict
 
-import asana  # type: ignore
+import asana
 
 from onyx.utils.logger import setup_logger
 
@@ -82,9 +82,16 @@ class AsanaAPI:
                 logger.info(f"Processed {project_count} projects")
 
         logger.info(f"Found {len(projects_list)} projects to process")
+        # Asana tasks can belong to multiple projects and thus tasks
+        # can get reported multiple times
+        seen_task_gids: set[str] = set()
         for project_gid in projects_list:
             for task in self._get_tasks_for_project(
-                project_gid, start_date, start_seconds
+                project_gid,
+                start_date,
+                start_seconds,
+                seen_task_gids,
+                project_gids,
             ):
                 yield task
         logger.info(f"Completed fetching {self.task_count} tasks from Asana")
@@ -94,7 +101,12 @@ class AsanaAPI:
             )
 
     def _get_tasks_for_project(
-        self, project_gid: str, start_date: str, start_seconds: int
+        self,
+        project_gid: str,
+        start_date: str,
+        start_seconds: int,
+        seen_task_gids: set[str],
+        project_gids: list[str] | None,
     ) -> Iterator[AsanaTask]:
         project = self.project_api.get_project(project_gid, opts={})
         project_name = project.get("name", project_gid)
@@ -104,20 +116,20 @@ class AsanaAPI:
         if project.get("archived"):
             logger.info(f"Skipping archived project: {project_name} ({project_gid})")
             return
-        if not team_gid:
+        # The team filter narrows the workspace-wide sync. When the user has
+        # picked specific projects via `project_gids`, respect that choice
+        # regardless of team membership — those projects were explicitly
+        # opted in upstream by the project_gid filter in get_tasks.
+        if (
+            project.get("privacy_setting") == "private"
+            and self.team_gid
+            and team_gid != self.team_gid
+            and project_gids is None
+        ):
             logger.info(
-                f"Skipping project without a team: {project_name} ({project_gid})"
+                f"Skipping private project not in configured team: {project_name} ({project_gid})"
             )
             return
-        if project.get("privacy_setting") == "private":
-            if self.team_gid and team_gid != self.team_gid:
-                logger.info(
-                    f"Skipping private project not in configured team: {project_name} ({project_gid})"
-                )
-                return
-            logger.info(
-                f"Processing private project in configured team: {project_name} ({project_gid})"
-            )
 
         simple_start_date = start_date.split(".")[0].split("+")[0]
         logger.info(
@@ -133,6 +145,15 @@ class AsanaAPI:
         }
         tasks_from_api = self.tasks_api.get_tasks_for_project(project_gid, opts)
         for data in tasks_from_api:
+            gid = data["gid"]
+            if gid in seen_task_gids:
+                logger.debug(
+                    f"Skipping duplicate Asana task {gid} "
+                    f"(already yielded for another project)"
+                )
+                continue
+            seen_task_gids.add(gid)
+
             self.task_count += 1
             if self.task_count % 10 == 0:
                 end_seconds = time.mktime(datetime.now().timetuple())

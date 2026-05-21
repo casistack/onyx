@@ -45,7 +45,9 @@ from fastapi_users import UUIDIDMixin
 from fastapi_users.authentication import AuthenticationBackend
 from fastapi_users.authentication import CookieTransport
 from fastapi_users.authentication import JWTStrategy
-from fastapi_users.authentication import RedisStrategy
+from fastapi_users.authentication import (
+    RedisStrategy,  # ty: ignore[possibly-missing-import]
+)
 from fastapi_users.authentication import Strategy
 from fastapi_users.authentication.strategy.db import AccessTokenDatabase
 from fastapi_users.authentication.strategy.db import DatabaseStrategy
@@ -80,6 +82,7 @@ from onyx.auth.pat import get_hashed_pat_from_request
 from onyx.auth.schemas import AuthBackend
 from onyx.auth.schemas import UserCreate
 from onyx.auth.schemas import UserRole
+from onyx.auth.signup_rate_limit import enforce_signup_rate_limit
 from onyx.configs.app_configs import AUTH_BACKEND
 from onyx.configs.app_configs import AUTH_COOKIE_EXPIRE_TIME_SECONDS
 from onyx.configs.app_configs import AUTH_TYPE
@@ -332,12 +335,28 @@ def verify_email_domain(email: str, *, is_registration: bool = False) -> None:
             raise OnyxError(OnyxErrorCode.INVALID_INPUT, "Email domain is not valid")
 
 
-def enforce_seat_limit(db_session: Session, seats_needed: int = 1) -> None:
-    """Raise HTTPException(402) if adding users would exceed the seat limit.
+def enforce_seat_limit(
+    db_session: Session,
+    seats_needed: int = 1,
+    lock_session: Session | None = None,
+) -> None:
+    """Raise ``OnyxError(SEAT_LIMIT_EXCEEDED)`` if seats would be exceeded.
 
-    No-op for multi-tenant or CE deployments.
+    Self-hosted runs ``check_seat_availability``; cloud delegates to
+    ``enforce_cloud_seat_limit`` which auto-bills via Stripe. Use
+    ``enforce_seat_limit_locked`` when followed by a write in the same
+    transaction.
     """
     if MULTI_TENANT:
+        fetch_ee_implementation_or_noop(
+            "onyx.server.tenants.billing",
+            "enforce_cloud_seat_limit",
+            lambda **_kw: None,
+        )(
+            seats_needed=seats_needed,
+            tenant_id=get_current_tenant_id(),
+            db_session=lock_session,
+        )
         return
 
     result = fetch_ee_implementation_or_noop(
@@ -346,6 +365,52 @@ def enforce_seat_limit(db_session: Session, seats_needed: int = 1) -> None:
 
     if result is not None and not result.available:
         raise OnyxError(OnyxErrorCode.SEAT_LIMIT_EXCEEDED, result.error_message)
+
+
+def enforce_seat_limit_locked(db_session: Session, seats_needed: int = 1) -> None:
+    """Acquire the tenant advisory lock on ``db_session``, then enforce.
+
+    Self-hosted: lock + ``check_seat_availability`` on the caller's
+    session — held until caller commits.
+
+    Cloud: lock + ``get_tenant_count`` + Stripe modify also held on the
+    caller's session — released on caller commit so the seat-consuming
+    write (e.g. ``activate_user``) is covered.
+    """
+    fetch_ee_implementation_or_noop("onyx.db.license", "acquire_seat_lock", None)(
+        db_session, get_current_tenant_id()
+    )
+
+    enforce_seat_limit(db_session, seats_needed=seats_needed, lock_session=db_session)
+
+
+def _user_currently_counts_toward_seats(user: User) -> bool:
+    """Delegate to canonical ``ee/onyx/db/license.py:user_counts_toward_seats``."""
+    return bool(
+        fetch_ee_implementation_or_noop(
+            "onyx.db.license", "user_counts_toward_seats", False
+        )(user)
+    )
+
+
+def _upgrade_will_add_seat(user_before: User, will_become_active: bool) -> bool:
+    """Whether promoting to STANDARD will consume a seat.
+
+    Cloud counts ``UserTenantMapping`` rows, not user attributes — an
+    upgrade leaves the mapping count unchanged, so always seat-neutral
+    in MT. Self-hosted compares the per-user predicate before vs after.
+    """
+    if MULTI_TENANT:
+        return False
+    will_be_counted = will_become_active and user_before.email != ANONYMOUS_USER_EMAIL
+    return will_be_counted and not _user_currently_counts_toward_seats(user_before)
+
+
+def _invalidate_license_cache_after_seat_change() -> None:
+    """Invalidate license cache so middleware re-reads ``used_seats``."""
+    fetch_ee_implementation_or_noop(
+        "onyx.db.license", "invalidate_license_cache", None
+    )()
 
 
 class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
@@ -378,35 +443,8 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         safe: bool = False,
         request: Optional[Request] = None,
     ) -> User:
-        # Verify captcha if enabled (for cloud signup protection)
-        from onyx.auth.captcha import CaptchaVerificationError
-        from onyx.auth.captcha import is_captcha_enabled
-        from onyx.auth.captcha import verify_captcha_token
-
-        if is_captcha_enabled() and request is not None:
-            # Get captcha token from request body or headers
-            captcha_token = None
-            if hasattr(user_create, "captcha_token"):
-                captcha_token = getattr(user_create, "captcha_token", None)
-
-            # Also check headers as a fallback
-            if not captcha_token:
-                captcha_token = request.headers.get("X-Captcha-Token")
-
-            try:
-                await verify_captcha_token(
-                    captcha_token or "", expected_action="signup"
-                )
-            except CaptchaVerificationError as e:
-                raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e))
-
-        # We verify the password here to make sure it's valid before we proceed
-        await self.validate_password(
-            user_create.password, cast(schemas.UC, user_create)
-        )
-
-        # Check for disposable emails BEFORE provisioning tenant
-        # This prevents creating tenants for throwaway email addresses
+        # Check for disposable emails FIRST so obvious throwaway domains are
+        # rejected before hitting Google's siteverify API. Cheap local check.
         try:
             verify_email_domain(user_create.email, is_registration=True)
         except OnyxError as e:
@@ -422,6 +460,35 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                     extra={"email_domain": domain},
                 )
             raise
+
+        if request is not None:
+            await enforce_signup_rate_limit(request)
+
+        # Verify captcha if enabled (for cloud signup protection)
+        from onyx.auth.captcha import CaptchaAction
+        from onyx.auth.captcha import CaptchaVerificationError
+        from onyx.auth.captcha import is_captcha_enabled
+        from onyx.auth.captcha import verify_captcha_token
+
+        if is_captcha_enabled() and request is not None:
+            # Get captcha token from request body or headers
+            captcha_token = None
+            if hasattr(user_create, "captcha_token"):
+                captcha_token = getattr(user_create, "captcha_token", None)
+
+            # Also check headers as a fallback
+            if not captcha_token:
+                captcha_token = request.headers.get("X-Captcha-Token")
+
+            try:
+                await verify_captcha_token(captcha_token or "", CaptchaAction.SIGNUP)
+            except CaptchaVerificationError as e:
+                raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(e))
+
+        # We verify the password here to make sure it's valid before we proceed
+        await self.validate_password(
+            user_create.password, cast(schemas.UC, user_create)
+        )
 
         user_count: int | None = None
         referral_source = (
@@ -462,20 +529,25 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                     self.user_db = tenant_user_db
 
                 if hasattr(user_create, "role"):
-                    user_create.role = UserRole.BASIC
+                    user_create.role = UserRole.BASIC  # ty: ignore[invalid-assignment]
 
                     user_count = await get_user_count()
                     if (
                         user_count == 0
                         or user_create.email in get_default_admin_user_emails()
                     ):
-                        user_create.role = UserRole.ADMIN
+                        user_create.role = (  # ty: ignore[invalid-assignment]
+                            UserRole.ADMIN
+                        )
 
-                # Check seat availability for new users (single-tenant only)
-                with get_session_with_current_tenant() as sync_db:
-                    existing = get_user_by_email(user_create.email, sync_db)
-                    if existing is None:
-                        enforce_seat_limit(sync_db)
+                # Lock + check on the same session that does the insert.
+                existing = await self.user_db.session.run_sync(
+                    lambda s: get_user_by_email(user_create.email, s)
+                )
+                if existing is None:
+                    await self.user_db.session.run_sync(
+                        lambda s: enforce_seat_limit_locked(s, seats_needed=1)
+                    )
 
                 user_created = False
                 try:
@@ -516,7 +588,9 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                     # Expire so the async session re-fetches the row updated by
                     # the sync session above.
                     self.user_db.session.expire(user)
-                    user = await self.user_db.get(user_id)  # type: ignore[assignment]
+                    user = await self.user_db.get(  # ty: ignore[invalid-assignment]
+                        user_id
+                    )
                 except exceptions.UserAlreadyExists:
                     user = await self.get_by_email(user_create.email)
 
@@ -544,7 +618,9 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                     # Expire so the async session re-fetches the row updated by
                     # the sync session above.
                     self.user_db.session.expire(user)
-                    user = await self.user_db.get(user_id)  # type: ignore[assignment]
+                    user = await self.user_db.get(  # ty: ignore[invalid-assignment]
+                        user_id
+                    )
                 if user_created:
                     await self._assign_default_pinned_assistants(user, db_session)
                 remove_user_from_invited_users(user_create.email)
@@ -586,14 +662,25 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         user_id: uuid.UUID,
         user_create: UserCreate,
     ) -> None:
-        """Upgrade a non-web user to STANDARD and assign default groups atomically.
+        """Upgrade a non-web user to STANDARD + assign groups in one tx.
 
-        All writes happen in a single sync transaction so neither the field
-        update nor the group assignment is visible without the other.
+        Enforces the seat limit inside the same transaction when the
+        upgrade flips an uncounted user (EXT_PERM_USER, SERVICE_ACCOUNT)
+        into a counted one.
         """
+        seat_added = False
         with get_session_with_current_tenant() as sync_db:
-            sync_user = sync_db.query(User).filter(User.id == user_id).first()  # type: ignore[arg-type]
+            sync_user = (
+                sync_db.query(User)
+                .filter(User.id == user_id)  # ty: ignore[invalid-argument-type]
+                .first()
+            )
             if sync_user:
+                if _upgrade_will_add_seat(
+                    sync_user, will_become_active=bool(sync_user.is_active)
+                ):
+                    enforce_seat_limit_locked(sync_db, seats_needed=1)
+                    seat_added = True
                 sync_user.hashed_password = self.password_helper.hash(
                     user_create.password
                 )
@@ -608,12 +695,15 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 sync_db.commit()
             else:
                 logger.warning(
-                    "User %s not found in sync session during upgrade to standard; "
-                    "skipping upgrade",
+                    "User %s not found in sync session during upgrade to standard; skipping upgrade",
                     user_id,
                 )
+        if seat_added:
+            _invalidate_license_cache_after_seat_change()
 
-    async def validate_password(self, password: str, _: schemas.UC | models.UP) -> None:
+    async def validate_password(  # ty: ignore[invalid-method-override]
+        self, password: str, _: schemas.UC | models.UP
+    ) -> None:
         # Validate password according to configurable security policy (defined via environment variables)
         if len(password) < PASSWORD_MIN_LENGTH:
             raise exceptions.InvalidPasswordException(
@@ -644,7 +734,7 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         return
 
     @log_function_time(print_only=True)
-    async def oauth_callback(
+    async def oauth_callback(  # ty: ignore[invalid-method-override]
         self,
         oauth_name: str,
         access_token: str,
@@ -725,9 +815,10 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 except exceptions.UserNotExists:
                     verify_email_domain(account_email, is_registration=True)
 
-                    # Check seat availability before creating (single-tenant only)
-                    with get_session_with_current_tenant() as sync_db:
-                        enforce_seat_limit(sync_db)
+                    # Lock + check on the same session that does the insert.
+                    await self.user_db.session.run_sync(
+                        lambda s: enforce_seat_limit_locked(s, seats_needed=1)
+                    )
 
                     password = self.password_helper.generate()
                     user_dict = {
@@ -754,7 +845,7 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                                 user,
                                 # NOTE: OAuthAccount DOES implement the OAuthAccountProtocol
                                 # but the type checker doesn't know that :(
-                                existing_oauth_account,  # type: ignore
+                                existing_oauth_account,  # ty: ignore[invalid-argument-type]
                                 oauth_account_dict,
                             )
 
@@ -777,19 +868,24 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                         if user_by_session:
                             user = user_by_session
 
-                # If the user is inactive, check seat availability before
-                # upgrading role — otherwise they'd become an inactive BASIC
-                # user who still can't log in.
-                if not user.is_active:
-                    with get_session_with_current_tenant() as sync_db:
-                        enforce_seat_limit(sync_db)
-
-                # Upgrade the user and assign default groups in a single
-                # transaction so neither change is visible without the other.
+                # Lock + check + upgrade in one transaction.
                 was_inactive = not user.is_active
+                seat_added = False
                 with get_session_with_current_tenant() as sync_db:
-                    sync_user = sync_db.query(User).filter(User.id == user.id).first()  # type: ignore[arg-type]
+                    sync_user = (
+                        sync_db.query(User)
+                        .filter(User.id == user.id)  # ty: ignore[invalid-argument-type]
+                        .first()
+                    )
                     if sync_user:
+                        will_become_active = (
+                            True if was_inactive else bool(sync_user.is_active)
+                        )
+                        if _upgrade_will_add_seat(
+                            sync_user, will_become_active=will_become_active
+                        ):
+                            enforce_seat_limit_locked(sync_db, seats_needed=1)
+                            seat_added = True
                         sync_user.is_verified = is_verified_by_default
                         sync_user.role = UserRole.BASIC
                         sync_user.account_type = AccountType.STANDARD
@@ -797,6 +893,8 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                             sync_user.is_active = True
                         assign_user_to_default_groups__no_commit(sync_db, sync_user)
                         sync_db.commit()
+                if seat_added:
+                    _invalidate_license_cache_after_seat_change()
 
                 # Refresh the async user object so downstream code
                 # (e.g. oidc_expiry check) sees the updated fields.
@@ -808,7 +906,7 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
             # otherwise, the oidc expiry will always be old, and the user will never be able to login
             if user.oidc_expiry is not None and not TRACK_EXTERNAL_IDP_EXPIRY:
                 await self.user_db.update(user, {"oidc_expiry": None})
-                user.oidc_expiry = None  # type: ignore
+                user.oidc_expiry = None  # ty: ignore[invalid-assignment]
             remove_user_from_invited_users(user.email)
             if token:
                 CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
@@ -925,7 +1023,11 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
             and (marketing_cookie_value := request.cookies.get(marketing_cookie_name))
             and (parsed_cookie := parse_posthog_cookie(marketing_cookie_value))
         ):
-            marketing_anonymous_id = parsed_cookie["distinct_id"]
+            marketing_anonymous_id = (
+                parsed_cookie[  # ty: ignore[possibly-unresolved-reference]
+                    "distinct_id"
+                ]
+            )
 
             # Technically, USER_SIGNED_UP is only fired from the cloud site when
             # it is the first user in a tenant. However, it is semantically correct
@@ -942,7 +1044,10 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
             }
 
             # Add all other values from the marketing cookie (featureFlags, etc.)
-            for key, value in parsed_cookie.items():
+            for (
+                key,
+                value,
+            ) in parsed_cookie.items():  # ty: ignore[possibly-unresolved-reference]
                 if key != "distinct_id":
                     properties.setdefault(key, value)
 
@@ -1074,7 +1179,8 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         )
         if not verified:
             # Raise some HTTPException (or your custom exception) if old password is invalid:
-            from fastapi import HTTPException, status
+            from fastapi import HTTPException
+            from fastapi import status
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1504,7 +1610,7 @@ async def _sync_jwt_oidc_expiry(
 
     if user.oidc_expiry is not None:
         await user_manager.user_db.update(user, {"oidc_expiry": None})
-        user.oidc_expiry = None  # type: ignore
+        user.oidc_expiry = None  # ty: ignore[invalid-assignment]
 
 
 async def _get_or_create_user_from_jwt(
@@ -1584,14 +1690,53 @@ async def _check_for_saml_and_jwt(
     return user
 
 
+async def _maybe_refresh_oauth_tokens(
+    user: User,
+    async_db_session: AsyncSession,
+    user_manager: BaseUserManager[User, uuid.UUID],
+) -> None:
+    """Best-effort refresh of any near-expiry OAuth access tokens.
+
+    PT_OAUTH MCP tools and any custom HTTP tool with bearer pass-through
+    forward `user.oauth_accounts[0].access_token` directly to the upstream
+    service. The web client's /auth/refresh ticker is gated off for
+    OIDC/SAML (see `web/src/hooks/useTokenRefresh.ts`), so without this hook
+    the stored access_token would rot at the IdP's lifetime (~1 h on
+    Microsoft Entra default) and downstream calls would 401 until the user
+    signs out and back in.
+
+    Refreshing here on every authenticated request is cheap — the underlying
+    `check_and_refresh_oauth_tokens` short-circuits when no account is
+    within the 5-minute renewal buffer. Failures log and return, so a
+    misconfigured IdP can never break authentication of an otherwise-valid
+    request.
+    """
+    # Local import mirrors the pattern at `get_refresh_router` to keep the
+    # auth module's load order resilient.
+    from onyx.auth.oauth_refresher import check_and_refresh_oauth_tokens
+
+    try:
+        await check_and_refresh_oauth_tokens(
+            user=user,
+            db_session=async_db_session,
+            user_manager=cast(Any, user_manager),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to opportunistically refresh OAuth tokens for %s",
+            user.email,
+        )
+
+
 async def optional_user(
     request: Request,
     async_db_session: AsyncSession = Depends(get_async_session),
     user: User | None = Depends(optional_fastapi_current_user),
+    user_manager: BaseUserManager[User, uuid.UUID] = Depends(get_user_manager),
 ) -> User | None:
-
     if user := await _check_for_saml_and_jwt(request, user, async_db_session):
         # If user is already set, _check_for_saml_and_jwt returns the same user object
+        await _maybe_refresh_oauth_tokens(user, async_db_session, user_manager)
         return user
 
     try:
@@ -1603,6 +1748,8 @@ async def optional_user(
         logger.warning("Issue with validating authentication token")
         return None
 
+    if user is not None:
+        await _maybe_refresh_oauth_tokens(user, async_db_session, user_manager)
     return user
 
 
@@ -2232,7 +2379,7 @@ def get_oauth_router(
 
             # Proceed to authenticate or create the user
             try:
-                user = await user_manager.oauth_callback(
+                user = await user_manager.oauth_callback(  # ty: ignore[invalid-argument-type]
                     oauth_client.name,
                     token["access_token"],
                     account_id,

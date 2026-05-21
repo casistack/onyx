@@ -59,6 +59,7 @@ from onyx.redis.redis_connector_delete import RedisConnectorDelete
 from onyx.redis.redis_connector_delete import RedisConnectorDeletePayload
 from onyx.redis.redis_pool import get_redis_client
 from onyx.redis.redis_pool import get_redis_replica_client
+from onyx.redis.redis_tenant_work_gating import maybe_mark_tenant_active
 from onyx.server.metrics.deletion_metrics import inc_deletion_blocked
 from onyx.server.metrics.deletion_metrics import inc_deletion_completed
 from onyx.server.metrics.deletion_metrics import inc_deletion_fence_reset
@@ -107,7 +108,7 @@ def revoke_tasks_blocking_deletion(
                 f"Revoked permissions sync task {permissions_sync_payload.celery_task_id}."
             )
     except Exception:
-        task_logger.exception("Exception while revoking pruning task")
+        task_logger.exception("Exception while revoking permissions sync task")
 
     try:
         prune_payload = redis_connector.prune.payload
@@ -115,7 +116,7 @@ def revoke_tasks_blocking_deletion(
             app.control.revoke(prune_payload.celery_task_id)
             task_logger.info(f"Revoked pruning task {prune_payload.celery_task_id}.")
     except Exception:
-        task_logger.exception("Exception while revoking permissions sync task")
+        task_logger.exception("Exception while revoking pruning task")
 
     try:
         external_group_sync_payload = redis_connector.external_group_sync.payload
@@ -165,12 +166,22 @@ def check_for_connector_deletion_task(self: Task, *, tenant_id: str) -> bool | N
 
             r.set(OnyxRedisSignals.BLOCK_VALIDATE_CONNECTOR_DELETION_FENCES, 1, ex=300)
 
-        # collect cc_pair_ids
+        # collect cc_pair_ids and note whether any are in DELETING status
         cc_pair_ids: list[int] = []
+        has_deleting_cc_pair = False
         with get_session_with_current_tenant() as db_session:
             cc_pairs = get_connector_credential_pairs(db_session)
             for cc_pair in cc_pairs:
                 cc_pair_ids.append(cc_pair.id)
+                if cc_pair.status == ConnectorCredentialPairStatus.DELETING:
+                    has_deleting_cc_pair = True
+
+        # Tenant-work-gating hook: mark only when at least one cc_pair is in
+        # DELETING status. Marking on bare cc_pair existence would keep
+        # nearly every tenant in the active set since most have cc_pairs
+        # but almost none are actively being deleted on any given cycle.
+        if has_deleting_cc_pair:
+            maybe_mark_tenant_active(tenant_id, caller="connector_deletion")
 
         # try running cleanup on the cc_pair_ids
         for cc_pair_id in cc_pair_ids:
@@ -517,7 +528,11 @@ def monitor_connector_deletion_taskset(
                 db_session=db_session,
                 connector_id=connector_id_to_delete,
             )
-            if not connector or not len(connector.credentials):
+            if not connector:
+                task_logger.info(
+                    "Connector deletion - Connector already deleted, skipping connector cleanup"
+                )
+            elif not len(connector.credentials):
                 task_logger.info(
                     "Connector deletion - Found no credentials left for connector, deleting connector"
                 )

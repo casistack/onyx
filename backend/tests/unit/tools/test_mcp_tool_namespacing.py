@@ -64,6 +64,7 @@ class DummyTool(Tool[None]):
         }
 
     def emit_start(self, placement: Placement) -> None:
+        del placement
         return None
 
     def run(

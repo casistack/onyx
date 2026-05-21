@@ -1,6 +1,7 @@
 "use client";
 
 import { toast } from "@/hooks/useToast";
+import { markdown } from "@opal/utils";
 
 import EmbeddingModelSelection from "../EmbeddingModelSelectionForm";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
@@ -39,7 +40,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import SimpleTooltip from "@/refresh-components/SimpleTooltip";
+import { Tooltip } from "@opal/components";
 import { SvgAlertTriangle, SvgArrowLeft, SvgArrowRight } from "@opal/icons";
 export default function EmbeddingForm() {
   const { formStep, nextFormStep, prevFormStep } = useEmbeddingFormContext();
@@ -52,7 +53,6 @@ export default function EmbeddingForm() {
       enable_contextual_rag: false,
       contextual_rag_llm_name: null,
       contextual_rag_llm_provider: null,
-      multilingual_expansion: [],
       disable_rerank_for_streaming: false,
       api_url: null,
       num_rerank: 0,
@@ -143,7 +143,6 @@ export default function EmbeddingForm() {
         enable_contextual_rag: searchSettings.enable_contextual_rag,
         contextual_rag_llm_name: searchSettings.contextual_rag_llm_name,
         contextual_rag_llm_provider: searchSettings.contextual_rag_llm_provider,
-        multilingual_expansion: searchSettings.multilingual_expansion,
         disable_rerank_for_streaming:
           searchSettings.disable_rerank_for_streaming,
         num_rerank: searchSettings.num_rerank,
@@ -286,31 +285,31 @@ export default function EmbeddingForm() {
                     setSwitchoverType(SwitchoverType.REINDEX);
                   }}
                 >
-                  <SimpleTooltip tooltip="Re-runs all connectors in the background before switching over. Takes longer but ensures no degredation of search during the switch.">
+                  <Tooltip tooltip="Re-runs all connectors in the background before switching over. Takes longer but ensures no degredation of search during the switch.">
                     <span className="w-full text-left">
                       (Recommended) Re-index
                     </span>
-                  </SimpleTooltip>
+                  </Tooltip>
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
                     setSwitchoverType(SwitchoverType.ACTIVE_ONLY);
                   }}
                 >
-                  <SimpleTooltip tooltip="Re-runs only active (non-paused) connectors in the background before switching over. Paused connectors won't block the switchover.">
+                  <Tooltip tooltip="Re-runs only active (non-paused) connectors in the background before switching over. Paused connectors won't block the switchover.">
                     <span className="w-full text-left">
                       Active Connectors Only
                     </span>
-                  </SimpleTooltip>
+                  </Tooltip>
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onClick={() => {
                     setSwitchoverType(SwitchoverType.INSTANT);
                   }}
                 >
-                  <SimpleTooltip tooltip="Immediately switches to new settings without re-indexing. Searches will be degraded until the re-indexing is complete.">
+                  <Tooltip tooltip="Immediately switches to new settings without re-indexing. Searches will be degraded until the re-indexing is complete.">
                     <span className="w-full text-left">Instant Switch</span>
-                  </SimpleTooltip>
+                  </Tooltip>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -538,7 +537,9 @@ export default function EmbeddingForm() {
             <Modal.Content>
               <Modal.Header
                 icon={SvgAlertTriangle}
-                title={`Are you sure you want to select ${selectedProvider.model_name}?`}
+                title={markdown(
+                  `Are you sure you want to select *${selectedProvider.model_name}*?`
+                )}
                 onClose={() => setShowPoorModel(false)}
               />
               <Modal.Body>

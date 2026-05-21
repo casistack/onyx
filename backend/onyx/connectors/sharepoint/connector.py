@@ -18,35 +18,44 @@ from urllib.parse import quote
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
-import msal  # type: ignore[import-untyped]
+import msal
 import requests
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
-from office365.graph_client import GraphClient  # type: ignore[import-untyped]
-from office365.onedrive.driveitems.driveItem import DriveItem  # type: ignore[import-untyped]
-from office365.onedrive.sites.site import Site  # type: ignore[import-untyped]
-from office365.onedrive.sites.sites_with_root import SitesWithRoot  # type: ignore[import-untyped]
-from office365.runtime.auth.token_response import TokenResponse  # type: ignore[import-untyped]
-from office365.runtime.client_request import ClientRequestException  # type: ignore
-from office365.runtime.paths.resource_path import ResourcePath  # type: ignore[import-untyped]
-from office365.runtime.queries.client_query import ClientQuery  # type: ignore[import-untyped]
-from office365.sharepoint.client_context import ClientContext  # type: ignore[import-untyped]
+from office365.graph_client import GraphClient
+from office365.onedrive.driveitems.driveItem import DriveItem
+from office365.onedrive.sites.site import Site
+from office365.onedrive.sites.sites_with_root import SitesWithRoot
+from office365.runtime.auth.token_response import TokenResponse
+from office365.runtime.client_request import ClientRequestException
+from office365.runtime.paths.resource_path import ResourcePath
+from office365.runtime.queries.client_query import ClientQuery
+from office365.sharepoint.client_context import ClientContext
 from pydantic import BaseModel
 from pydantic import Field
 from requests.exceptions import HTTPError
+from typing_extensions import override
 
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
 from onyx.configs.app_configs import REQUEST_TIMEOUT_SECONDS
 from onyx.configs.app_configs import SHAREPOINT_CONNECTOR_SIZE_THRESHOLD
 from onyx.configs.constants import DocumentSource
 from onyx.configs.constants import FileOrigin
+from onyx.connectors.cross_connector_utils.tabular_section_utils import (
+    extract_and_stage_tabular_file,
+)
+from onyx.connectors.cross_connector_utils.tabular_section_utils import is_tabular_file
+from onyx.connectors.cross_connector_utils.tabular_section_utils import (
+    tabular_file_to_sections,
+)
 from onyx.connectors.exceptions import ConnectorValidationError
 from onyx.connectors.interfaces import CheckpointedConnectorWithPermSync
 from onyx.connectors.interfaces import CheckpointOutput
 from onyx.connectors.interfaces import GenerateSlimDocumentOutput
 from onyx.connectors.interfaces import IndexingHeartbeatInterface
 from onyx.connectors.interfaces import SecondsSinceUnixEpoch
+from onyx.connectors.interfaces import SlimConnector
 from onyx.connectors.interfaces import SlimConnectorWithPermSync
 from onyx.connectors.microsoft_graph_env import resolve_microsoft_environment
 from onyx.connectors.models import BasicExpertInfo
@@ -60,6 +69,7 @@ from onyx.connectors.models import ExternalAccess
 from onyx.connectors.models import HierarchyNode
 from onyx.connectors.models import ImageSection
 from onyx.connectors.models import SlimDocument
+from onyx.connectors.models import TabularSection
 from onyx.connectors.models import TextSection
 from onyx.connectors.sharepoint.connector_utils import get_sharepoint_external_access
 from onyx.db.enums import HierarchyNodeType
@@ -68,8 +78,12 @@ from onyx.file_processing.extract_file_text import get_file_ext
 from onyx.file_processing.file_types import OnyxFileExtensions
 from onyx.file_processing.file_types import OnyxMimeTypes
 from onyx.file_processing.image_utils import store_image_and_create_section
+from onyx.file_store.staging import RawFileCallback
 from onyx.utils.b64 import get_image_type_from_bytes
 from onyx.utils.logger import setup_logger
+from onyx.utils.threadpool_concurrency import run_functions_tuples_in_parallel
+from onyx.utils.url import SSRFException
+from onyx.utils.url import validate_outbound_http_url
 
 logger = setup_logger()
 SLIM_BATCH_SIZE = 1000
@@ -130,6 +144,12 @@ DEFAULT_SHAREPOINT_DOMAIN_SUFFIX = "sharepoint.com"
 GRAPH_API_BASE = f"{DEFAULT_GRAPH_API_HOST}/v1.0"
 GRAPH_API_MAX_RETRIES = 5
 GRAPH_API_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Cap how many configured sites the perm-sync RoleAssignments probe checks at
+# validation time. Each probe is one HTTP round-trip, so we trade exhaustive
+# coverage for keeping connector creation responsive on tenants with many
+# configured sites.
+ROLE_ASSIGNMENTS_PROBE_MAX_SITES = 5
 
 
 class DriveItemData(BaseModel):
@@ -258,7 +278,11 @@ def sleep_and_retry(
                 logger.warning(
                     f"Rate limit exceeded on {method_name}, attempt {attempt + 1}/{max_retries + 1}, sleeping and retrying"
                 )
-                retry_after = e.response.headers.get("Retry-After")
+                retry_after = (
+                    e.response.headers.get(  # ty: ignore[unresolved-attribute]
+                        "Retry-After"
+                    )
+                )
                 if retry_after:
                     sleep_time = int(retry_after)
                 else:
@@ -269,9 +293,14 @@ def sleep_and_retry(
                 time.sleep(sleep_time)
                 continue
 
-            # Non-retryable error or retries exhausted — log details and raise.
+            # Non-retryable error or retries exhausted. The exception is
+            # re-raised for the caller to handle — several callers already
+            # swallow expected statuses (e.g. 404 for deleted Azure AD
+            # groups in permission_utils.py:503). Log at warning so the
+            # helper isn't the source of Sentry events for conditions the
+            # caller intentionally handles.
             if e.response is not None:
-                logger.error(
+                logger.warning(
                     f"SharePoint request failed for {method_name}: status={status}, "
                 )
             raise e
@@ -374,6 +403,32 @@ def acquire_token_for_rest(
         scopes=[f"https://{sp_tenant_domain}.{sharepoint_domain_suffix}/.default"]
     )
     return TokenResponse.from_json(token)
+
+
+def _probe_site_role_assignments_authorized(
+    site_url: str, headers: dict[str, str]
+) -> bool:
+    """Issue a single RoleAssignments REST probe against `site_url`.
+
+    Returns True if the SharePoint REST surface accepts the call (any non-401/403
+    status), False if SP rejected it as unauthorized. Transport-level errors are
+    swallowed and treated as authorized so a transient network blip doesn't fail
+    validation; the runtime perm-sync code will surface real failures.
+
+    Designed to be called via run_functions_tuples_in_parallel — keep it side-
+    effect free aside from logging.
+    """
+    probe_url = f"{site_url.rstrip('/')}/_api/web/roleassignments?$top=1"
+    try:
+        resp = requests.get(probe_url, headers=headers, timeout=10)
+    except Exception as e:
+        logger.warning(
+            "RoleAssignments permission probe failed for %s (non-blocking): %s",
+            site_url,
+            e,
+        )
+        return True
+    return resp.status_code not in (401, 403)
 
 
 def _create_document_failure(
@@ -518,6 +573,7 @@ def _convert_driveitem_to_document_with_permissions(
     parent_hierarchy_raw_node_id: str | None = None,
     access_token: str | None = None,
     treat_sharing_link_as_public: bool = False,
+    raw_file_callback: RawFileCallback | None = None,
 ) -> Document | ConnectorFailure | None:
 
     if not driveitem.name or not driveitem.id:
@@ -586,7 +642,9 @@ def _convert_driveitem_to_document_with_permissions(
                 driveitem, f"Failed to download via graph api: {e}", e
             )
 
-    sections: list[TextSection | ImageSection] = []
+    sections: list[TextSection | ImageSection | TabularSection] = []
+    # Only tabular files carry a `file_id` on the Document
+    staged_file_id: str | None = None
     file_ext = get_file_ext(driveitem.name)
 
     if not content_bytes:
@@ -602,6 +660,30 @@ def _convert_driveitem_to_document_with_permissions(
         )
         image_section.link = driveitem.web_url
         sections.append(image_section)
+    elif is_tabular_file(driveitem.name):
+        try:
+            if raw_file_callback is not None:
+                result = extract_and_stage_tabular_file(
+                    file=io.BytesIO(content_bytes),
+                    file_name=driveitem.name,
+                    content_type=mime_type or "application/octet-stream",
+                    raw_file_callback=raw_file_callback,
+                    link=driveitem.web_url or "",
+                )
+                sections.extend(result.sections)
+                staged_file_id = result.staged_file_id
+            else:
+                sections.extend(
+                    tabular_file_to_sections(
+                        file=io.BytesIO(content_bytes),
+                        file_name=driveitem.name,
+                        link=driveitem.web_url or "",
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to extract tabular sections for '{driveitem.name}': {e}"
+            )
     else:
 
         def _store_embedded_image(img_data: bytes, img_name: str) -> None:
@@ -674,6 +756,7 @@ def _convert_driveitem_to_document_with_permissions(
         ],
         metadata={"drive": drive_name},
         parent_hierarchy_raw_node_id=parent_hierarchy_raw_node_id,
+        file_id=staged_file_id,
     )
     return doc
 
@@ -811,7 +894,7 @@ def _convert_sitepage_to_document(
 
     if include_permissions:
         external_access = get_sharepoint_external_access(
-            ctx=ctx,
+            ctx=ctx,  # ty: ignore[invalid-argument-type]
             graph_client=graph_client,
             site_page=site_page,
             add_prefix=True,
@@ -875,26 +958,26 @@ def _convert_sitepage_to_slim_document(
     treat_sharing_link_as_public: bool = False,
 ) -> SlimDocument:
     """Convert a SharePoint site page to a SlimDocument object."""
-    if site_page.get("id") is None:
+    page_id = site_page.get("id")
+    if page_id is None:
         raise ValueError("Site page ID is required")
 
     external_access = get_sharepoint_external_access(
-        ctx=ctx,
+        ctx=ctx,  # ty: ignore[invalid-argument-type]
         graph_client=graph_client,
         site_page=site_page,
         treat_sharing_link_as_public=treat_sharing_link_as_public,
     )
-    id = site_page.get("id")
-    if id is None:
-        raise ValueError("Site page ID is required")
+
     return SlimDocument(
-        id=id,
+        id=page_id,
         external_access=external_access,
         parent_hierarchy_raw_node_id=parent_hierarchy_raw_node_id,
     )
 
 
 class SharepointConnector(
+    SlimConnector,
     SlimConnectorWithPermSync,
     CheckpointedConnectorWithPermSync[SharepointConnectorCheckpoint],
 ):
@@ -959,6 +1042,100 @@ class SharepointConnector(
                 raise ConnectorValidationError(
                     "Site URLs must be full Sharepoint URLs (e.g. https://your-tenant.sharepoint.com/sites/your-site or https://your-tenant.sharepoint.com/teams/your-team)"
                 )
+            try:
+                validate_outbound_http_url(site_url, https_only=True)
+            except (SSRFException, ValueError) as e:
+                raise ConnectorValidationError(
+                    f"Invalid site URL '{site_url}': {e}"
+                ) from e
+
+    def probe_role_assignments_permission(self) -> None:
+        """Verify the Azure AD app can read SharePoint RoleAssignments.
+
+        Required for permission sync (RoleAssignments enumeration uses the
+        SharePoint REST surface, which is granted separately from Graph and
+        can be granted unevenly across sites under the Sites.Selected model).
+        Probes up to the first ROLE_ASSIGNMENTS_PROBE_MAX_SITES configured
+        sites in parallel and fails if any of them rejects the request, so
+        per-site permission gaps surface at validation time rather than
+        mid-index. Only runs when credentials have been loaded.
+        """
+        if not (self.msal_app and self.sp_tenant_domain and self.sites):
+            return
+        try:
+            token_response = acquire_token_for_rest(
+                self.msal_app,
+                self.sp_tenant_domain,
+                self.sharepoint_domain_suffix,
+            )
+        except Exception as e:
+            logger.warning(
+                "RoleAssignments permission probe failed (non-blocking): %s", e
+            )
+            return
+
+        sites_to_probe = self.sites[:ROLE_ASSIGNMENTS_PROBE_MAX_SITES]
+        headers = {"Authorization": f"Bearer {token_response.accessToken}"}
+        results = run_functions_tuples_in_parallel(
+            [
+                (_probe_site_role_assignments_authorized, (site_url, headers))
+                for site_url in sites_to_probe
+            ],
+            allow_failures=True,
+        )
+        unauthorized_sites: list[str] = [
+            site_url
+            for site_url, authorized in zip(sites_to_probe, results)
+            if authorized is False
+        ]
+
+        if not unauthorized_sites:
+            return
+
+        sites_summary = ", ".join(unauthorized_sites)
+        raise ConnectorValidationError(
+            "The Azure AD app registration is missing the required SharePoint permission "
+            "to read role assignments on the following site(s): "
+            f"{sites_summary}. Please grant 'Sites.FullControl.All' "
+            "(application permission) in the Azure portal and re-run admin consent. "
+            "If using the 'Sites.Selected' model, ensure the app has been explicitly "
+            "granted full-control on each affected site collection."
+        )
+
+    def probe_group_members_permission(self) -> None:
+        """Verify the Azure AD app can enumerate Azure AD group members via Graph.
+
+        Required for permission sync, which expands Azure AD groups attached to
+        SharePoint role assignments via `GET /v1.0/groups/{id}/members`. Tested
+        via `GET /v1.0/groups?$top=1`, which requires the same permission set
+        (GroupMember.Read.All / Group.Read.All / Directory.Read.All) so a 403
+        here reliably predicts a 403 on the members call. Only runs when
+        credentials have been loaded.
+        """
+        if not self.msal_app:
+            return
+        try:
+            access_token = self._get_graph_access_token()
+            probe_url = f"{self.graph_api_base}/groups"
+            resp = requests.get(
+                probe_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"$top": "1", "$select": "id"},
+                timeout=10,
+            )
+            if resp.status_code in (401, 403):
+                raise ConnectorValidationError(
+                    "The Azure AD app registration is missing the required Microsoft Graph "
+                    "permission to enumerate Azure AD group members. Please grant "
+                    "'GroupMember.Read.All' (application permission) in the Azure portal "
+                    "and re-run admin consent."
+                )
+        except ConnectorValidationError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Group members permission probe failed (non-blocking): %s", e
+            )
 
     def _extract_tenant_domain_from_sites(self) -> str | None:
         """Extract the tenant domain from configured site URLs.
@@ -1769,6 +1946,7 @@ class SharepointConnector(
         self,
         start: datetime | None = None,
         end: datetime | None = None,
+        include_permissions: bool = True,
     ) -> GenerateSlimDocumentOutput:
         site_descriptors = self._filter_excluded_sites(
             self.site_descriptors or self.fetch_sites()
@@ -1827,17 +2005,28 @@ class SharepointConnector(
 
                     try:
                         logger.debug(f"Processing: {driveitem.web_url}")
-                        ctx = self._create_rest_client_context(site_descriptor.url)
-                        doc_batch.append(
-                            _convert_driveitem_to_slim_document(
-                                driveitem,
-                                drive_name,
-                                ctx,
-                                self.graph_client,
-                                parent_hierarchy_raw_node_id=parent_hierarchy_url,
-                                treat_sharing_link_as_public=self.treat_sharing_link_as_public,
+                        if include_permissions:
+                            ctx = self._create_rest_client_context(site_descriptor.url)
+                            doc_batch.append(
+                                _convert_driveitem_to_slim_document(
+                                    driveitem,
+                                    drive_name,
+                                    ctx,
+                                    self.graph_client,
+                                    parent_hierarchy_raw_node_id=parent_hierarchy_url,
+                                    treat_sharing_link_as_public=self.treat_sharing_link_as_public,
+                                )
                             )
-                        )
+                        else:
+                            if driveitem.id is None:
+                                raise ValueError("DriveItem ID is required")
+                            doc_batch.append(
+                                SlimDocument(
+                                    id=driveitem.id,
+                                    external_access=ExternalAccess.empty(),
+                                    parent_hierarchy_raw_node_id=parent_hierarchy_url,
+                                )
+                            )
                     except Exception as e:
                         logger.warning(f"Failed to process driveitem: {str(e)}")
 
@@ -1854,16 +2043,34 @@ class SharepointConnector(
                     logger.debug(
                         f"Processing site page: {site_page.get('webUrl', site_page.get('name', 'Unknown'))}"
                     )
-                    ctx = self._create_rest_client_context(site_descriptor.url)
-                    doc_batch.append(
-                        _convert_sitepage_to_slim_document(
-                            site_page,
-                            ctx,
-                            self.graph_client,
-                            parent_hierarchy_raw_node_id=site_descriptor.url,
-                            treat_sharing_link_as_public=self.treat_sharing_link_as_public,
+                    try:
+                        if include_permissions:
+                            ctx = self._create_rest_client_context(site_descriptor.url)
+                            doc_batch.append(
+                                _convert_sitepage_to_slim_document(
+                                    site_page,
+                                    ctx,
+                                    self.graph_client,
+                                    parent_hierarchy_raw_node_id=site_descriptor.url,
+                                    treat_sharing_link_as_public=self.treat_sharing_link_as_public,
+                                )
+                            )
+                        else:
+                            page_id = site_page.get("id")
+                            if page_id is None:
+                                raise ValueError("Site page ID is required")
+                            doc_batch.append(
+                                SlimDocument(
+                                    id=page_id,
+                                    external_access=ExternalAccess.empty(),
+                                    parent_hierarchy_raw_node_id=site_descriptor.url,
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to process site page "
+                            f"{site_page.get('webUrl', site_page.get('name', 'Unknown'))}: {e}"
                         )
-                    )
                     if len(doc_batch) >= SLIM_BATCH_SIZE:
                         yield doc_batch
                         doc_batch = []
@@ -1936,8 +2143,7 @@ class SharepointConnector(
         self._graph_client = GraphClient(
             _acquire_token_for_graph, environment=self._azure_environment
         )
-        if auth_method == SharepointAuthMethod.CERTIFICATE.value:
-            self.sp_tenant_domain = self._resolve_tenant_domain()
+        self.sp_tenant_domain = self._resolve_tenant_domain()
         return None
 
     def _get_drive_names_for_site(self, site_url: str) -> list[str]:
@@ -2417,6 +2623,7 @@ class SharepointConnector(
                         graph_api_base=self.graph_api_base,
                         access_token=access_token,
                         treat_sharing_link_as_public=self.treat_sharing_link_as_public,
+                        raw_file_callback=self.raw_file_callback,
                     )
 
                     if isinstance(doc_or_failure, Document):
@@ -2571,6 +2778,28 @@ class SharepointConnector(
     ) -> SharepointConnectorCheckpoint:
         return SharepointConnectorCheckpoint.model_validate_json(checkpoint_json)
 
+    @override
+    def retrieve_all_slim_docs(
+        self,
+        start: SecondsSinceUnixEpoch | None = None,
+        end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,  # noqa: ARG002
+    ) -> GenerateSlimDocumentOutput:
+        start_dt = (
+            datetime.fromtimestamp(start, tz=timezone.utc)
+            if start is not None
+            else None
+        )
+        end_dt = (
+            datetime.fromtimestamp(end, tz=timezone.utc) if end is not None else None
+        )
+        yield from self._fetch_slim_documents_from_sharepoint(
+            start=start_dt,
+            end=end_dt,
+            include_permissions=False,
+        )
+
+    @override
     def retrieve_all_slim_docs_perm_sync(
         self,
         start: SecondsSinceUnixEpoch | None = None,
@@ -2588,6 +2817,7 @@ class SharepointConnector(
         yield from self._fetch_slim_documents_from_sharepoint(
             start=start_dt,
             end=end_dt,
+            include_permissions=True,
         )
 
 

@@ -2,7 +2,7 @@
 
 import { useSWRConfig } from "swr";
 import { useFormikContext } from "formik";
-import * as InputLayouts from "@/layouts/input-layouts";
+import { InputDivider } from "@opal/layouts";
 import {
   LLMProviderFormProps,
   LLMProviderName,
@@ -78,20 +78,20 @@ function OpenRouterModalInternals({
 
       {!isOnboarding && (
         <>
-          <InputLayouts.FieldSeparator />
+          <InputDivider />
           <DisplayNameField disabled={!!existingLlmProvider} />
         </>
       )}
 
-      <InputLayouts.FieldSeparator />
+      <InputDivider />
       <ModelSelectionField
-        shouldShowAutoUpdateToggle={false}
+        shouldShowAutoUpdateToggle={true}
         onRefetch={isFetchDisabled ? undefined : handleFetchModels}
       />
 
       {!isOnboarding && (
         <>
-          <InputLayouts.FieldSeparator />
+          <InputDivider />
           <ModelAccessField />
         </>
       )}

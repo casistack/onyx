@@ -229,7 +229,7 @@ def transition_attempt_to_in_progress(
             )
 
         attempt.status = IndexingStatus.IN_PROGRESS
-        attempt.time_started = attempt.time_started or func.now()  # type: ignore
+        attempt.time_started = attempt.time_started or func.now()
         db_session.commit()
         return attempt
     except Exception:
@@ -250,7 +250,7 @@ def mark_attempt_in_progress(
         ).scalar_one()
 
         attempt.status = IndexingStatus.IN_PROGRESS
-        attempt.time_started = index_attempt.time_started or func.now()  # type: ignore
+        attempt.time_started = index_attempt.time_started or func.now()
         db_session.commit()
 
         # Add telemetry for index attempt status change
@@ -546,6 +546,9 @@ def get_latest_index_attempts_parallel(
     eager_load_cc_pair: bool = False,
     only_finished: bool = False,
 ) -> Sequence[IndexAttempt]:
+    # The session closes before returning, so only set eager_load_cc_pair=True if the
+    # caller actually accesses those relationships — otherwise it loads data for nothing
+    # and error_rows in particular can be very expensive on large deployments.
     with get_session_with_current_tenant() as db_session:
         return get_latest_index_attempts(
             secondary_index,
@@ -886,6 +889,7 @@ def create_index_attempt_error(
     failure: ConnectorFailure,
     db_session: Session,
 ) -> int:
+    exc = failure.exception
     new_error = IndexAttemptError(
         index_attempt_id=index_attempt_id,
         connector_credential_pair_id=connector_credential_pair_id,
@@ -908,6 +912,7 @@ def create_index_attempt_error(
         ),
         failure_message=failure.failure_message,
         is_resolved=False,
+        error_type=type(exc).__name__ if exc else None,
     )
     db_session.add(new_error)
     db_session.commit()
@@ -964,3 +969,50 @@ def get_index_attempt_errors_for_cc_pair(
         stmt = stmt.offset(page * page_size).limit(page_size)
 
     return list(db_session.scalars(stmt).all())
+
+
+def get_index_attempt_errors_across_connectors(
+    db_session: Session,
+    cc_pair_id: int | None = None,
+    error_type: str | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    unresolved_only: bool = True,
+    page: int = 0,
+    page_size: int = 25,
+) -> tuple[list[IndexAttemptError], int]:
+    """Query index attempt errors across all connectors with optional filters.
+
+    Returns (errors, total_count) for pagination.
+    """
+    stmt = select(IndexAttemptError)
+    count_stmt = select(func.count()).select_from(IndexAttemptError)
+
+    if cc_pair_id is not None:
+        stmt = stmt.where(IndexAttemptError.connector_credential_pair_id == cc_pair_id)
+        count_stmt = count_stmt.where(
+            IndexAttemptError.connector_credential_pair_id == cc_pair_id
+        )
+
+    if error_type is not None:
+        stmt = stmt.where(IndexAttemptError.error_type == error_type)
+        count_stmt = count_stmt.where(IndexAttemptError.error_type == error_type)
+
+    if unresolved_only:
+        stmt = stmt.where(IndexAttemptError.is_resolved.is_(False))
+        count_stmt = count_stmt.where(IndexAttemptError.is_resolved.is_(False))
+
+    if start_time is not None:
+        stmt = stmt.where(IndexAttemptError.time_created >= start_time)
+        count_stmt = count_stmt.where(IndexAttemptError.time_created >= start_time)
+
+    if end_time is not None:
+        stmt = stmt.where(IndexAttemptError.time_created <= end_time)
+        count_stmt = count_stmt.where(IndexAttemptError.time_created <= end_time)
+
+    stmt = stmt.order_by(desc(IndexAttemptError.time_created))
+    stmt = stmt.offset(page * page_size).limit(page_size)
+
+    total = db_session.scalar(count_stmt) or 0
+    errors = list(db_session.scalars(stmt).all())
+    return errors, total

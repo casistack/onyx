@@ -25,10 +25,11 @@ import ReactMarkdown from "react-markdown";
 import { FaMarkdown } from "react-icons/fa";
 import { useState, useEffect, memo, JSX } from "react";
 import remarkGfm from "remark-gfm";
-import Checkbox from "@/refresh-components/inputs/Checkbox";
+import { Checkbox } from "@opal/components";
 
 import { Section } from "@/layouts/general-layouts";
-import { cn, transformLinkUri } from "@/lib/utils";
+import { transformLinkUri } from "@/lib/utils";
+import { cn } from "@opal/utils";
 import FileInput from "@/app/admin/connectors/[connector]/pages/ConnectorInput/FileInput";
 import InputDatePicker from "@/refresh-components/inputs/InputDatePicker";
 import { RichTextSubtext } from "./RichTextSubtext";
@@ -41,7 +42,7 @@ import {
 import Text from "@/refresh-components/texts/Text";
 import CreateButton from "@/refresh-components/buttons/CreateButton";
 
-import SimpleTooltip from "@/refresh-components/SimpleTooltip";
+import { Tooltip } from "@opal/components";
 import InputTextArea, {
   InputTextAreaProps,
 } from "@/refresh-components/inputs/InputTextArea";
@@ -148,9 +149,9 @@ export function ExplanationText({
 
 export function ToolTipDetails({ children }: { children: string }) {
   return (
-    <SimpleTooltip tooltip={children} side="top" align="center">
+    <Tooltip tooltip={children} side="top" align="center">
       <FiInfo size={12} />
-    </SimpleTooltip>
+    </Tooltip>
   );
 }
 
@@ -736,11 +737,8 @@ export const BooleanFormField = memo(function BooleanFormField({
           };
 
           return (
-            <SimpleTooltip
-              // This may seem confusing, but we only want to show the `disabledTooltip` if and only if the `BooleanFormField` is disabled.
-              // If it disabled, then we "enable" the showing of the tooltip. Thus, `disabled={!disabled}` is not a mistake.
-              disabled={!disabled}
-              tooltip={disabledTooltip}
+            <Tooltip
+              tooltip={disabled ? disabledTooltip : undefined}
               side={disabledTooltipSide}
             >
               <Section flexDirection="row" width="fit" height="fit" gap={0}>
@@ -776,7 +774,7 @@ export const BooleanFormField = memo(function BooleanFormField({
                   </div>
                 )}
               </Section>
-            </SimpleTooltip>
+            </Tooltip>
           );
         }}
       </FastField>

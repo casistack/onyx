@@ -60,6 +60,7 @@ from onyx.db.tools import create_tool__no_commit
 from onyx.db.tools import delete_tool__no_commit
 from onyx.db.tools import get_tools_by_mcp_server_id
 from onyx.redis.redis_pool import get_redis_client
+from onyx.server.features.mcp.models import apply_auto_substitutions
 from onyx.server.features.mcp.models import MCPApiKeyResponse
 from onyx.server.features.mcp.models import MCPAuthTemplate
 from onyx.server.features.mcp.models import MCPConnectionData
@@ -82,6 +83,7 @@ from onyx.tools.tool_implementations.mcp.mcp_client import discover_mcp_tools
 from onyx.tools.tool_implementations.mcp.mcp_client import initialize_mcp_client
 from onyx.tools.tool_implementations.mcp.mcp_client import log_exception_group
 from onyx.utils.encryption import mask_string
+from onyx.utils.encryption import reject_masked_credentials
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -96,30 +98,127 @@ def _truncate_description(description: str | None, max_length: int = 500) -> str
     return description[: max_length - 3] + "..."
 
 
-# TODO: Replace mask-comparison approach with an explicit Unset sentinel from the
-# frontend indicating whether each credential field was actually modified. The current
-# approach is brittle (e.g. short credentials produce a fixed-length mask that could
-# collide) and mutates request values, which is surprising. The frontend should signal
-# "unchanged" vs "new value" directly rather than relying on masked-string equality.
-def _restore_masked_oauth_credentials(
+def _resolve_oauth_credentials(
+    *,
     request_client_id: str | None,
+    request_client_id_changed: bool,
     request_client_secret: str | None,
-    existing_client: OAuthClientInformationFull,
+    request_client_secret_changed: bool,
+    existing_client: OAuthClientInformationFull | None,
 ) -> tuple[str | None, str | None]:
-    """If the frontend sent back masked credentials, restore the real stored values."""
-    if (
-        request_client_id
-        and existing_client.client_id
-        and request_client_id == mask_string(existing_client.client_id)
-    ):
-        request_client_id = existing_client.client_id
-    if (
-        request_client_secret
-        and existing_client.client_secret
-        and request_client_secret == mask_string(existing_client.client_secret)
-    ):
-        request_client_secret = existing_client.client_secret
-    return request_client_id, request_client_secret
+    """Pick the effective client_id / client_secret for an upsert/connect.
+
+    Mirrors the LLM-provider `api_key_changed` pattern: when the frontend
+    flags a field as unchanged, ignore whatever value it sent (it is most
+    likely a masked placeholder) and reuse the stored value. When the
+    frontend flags a field as changed, take the request value as-is, but
+    defensively reject masked placeholders so a buggy client can't write
+    a mask to the database.
+
+    When there is no stored client yet (`existing_client is None`), an
+    unchanged flag means the user did not edit since load — still use the
+    request body (`_connect_oauth` runs after upsert with the same payload).
+    Treating unchanged plus no storage as None would rebuild empty OAuth config.
+    """
+    resolved_id = request_client_id
+    if not request_client_id_changed:
+        resolved_id = (
+            existing_client.client_id if existing_client else request_client_id
+        )
+    elif resolved_id:
+        reject_masked_credentials({"oauth_client_id": resolved_id})
+
+    resolved_secret = request_client_secret
+    if not request_client_secret_changed:
+        resolved_secret = (
+            existing_client.client_secret if existing_client else request_client_secret
+        )
+    elif resolved_secret:
+        reject_masked_credentials({"oauth_client_secret": resolved_secret})
+
+    return resolved_id, resolved_secret
+
+
+def _build_oauth_admin_config_data(
+    *,
+    client_id: str | None,
+    client_secret: str | None,
+) -> MCPConnectionData:
+    """Construct the admin connection config payload for an OAuth client.
+
+    A public client legitimately has no `client_secret`, so we only require
+    a `client_id` to seed `client_info`. When no client_id is available we
+    fall through to an empty config (the OAuth provider will rely on
+    Dynamic Client Registration to obtain credentials).
+    """
+    config_data = MCPConnectionData(headers={})
+    if not client_id:
+        return config_data
+    token_endpoint_auth_method = "client_secret_post" if client_secret else "none"
+    client_info = OAuthClientInformationFull(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uris=[AnyUrl(f"{WEB_DOMAIN}/mcp/oauth/callback")],
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        scope=REQUESTED_SCOPE,  # TODO(evan): allow specifying scopes?
+        token_endpoint_auth_method=token_endpoint_auth_method,
+    )
+    config_data[MCPOAuthKeys.CLIENT_INFO.value] = client_info.model_dump(mode="json")
+    return config_data
+
+
+def _build_oauth_admin_config_data_for_update(
+    *,
+    client_id: str | None,
+    client_secret: str | None,
+    existing_client: OAuthClientInformationFull,
+) -> MCPConnectionData:
+    """Construct the admin connection config payload for an OAuth client
+    that already has a stored `client_info`, preserving provider-managed
+    fields (DCR registration token, expiry timestamps, negotiated auth
+    method, etc.) wherever possible.
+
+    When `client_id` matches the stored client_id, the merged payload
+    starts from `existing_client` and only overwrites the admin-managed
+    fields (`client_secret`, `redirect_uris`, `scope`). When `client_id`
+    differs, the admin is pointing at a brand-new OAuth registration so
+    the old DCR metadata is stale; we fall back to the template path.
+    """
+    if not client_id:
+        # No id means we have nothing to seed client_info with; matches
+        # the template-path behavior of returning an empty config so the
+        # OAuth provider can attempt DCR.
+        return _build_oauth_admin_config_data(
+            client_id=client_id, client_secret=client_secret
+        )
+
+    if existing_client.client_id != client_id:
+        logger.info(
+            "OAuth client_id changed for existing MCP server; discarding "
+            "stored DCR registration metadata and starting fresh."
+        )
+        return _build_oauth_admin_config_data(
+            client_id=client_id, client_secret=client_secret
+        )
+
+    merged = existing_client.model_copy(deep=True)
+    merged.client_secret = client_secret
+    merged.redirect_uris = [AnyUrl(f"{WEB_DOMAIN}/mcp/oauth/callback")]
+    merged.scope = REQUESTED_SCOPE  # TODO(evan): allow specifying scopes?
+    # Heal stale records that were seeded before `_upsert_mcp_server` always
+    # set `token_endpoint_auth_method`. The SDK silently omits the client
+    # secret on token exchange when this is None, which manifests as
+    # `invalid_client` from the IdP. Preserve any explicitly-negotiated
+    # method (e.g. DCR's `client_secret_basic`).
+    if merged.token_endpoint_auth_method is None:
+        merged.token_endpoint_auth_method = (
+            "client_secret_post" if client_secret else "none"
+        )
+
+    config_data = MCPConnectionData(headers={})
+    config_data[MCPOAuthKeys.CLIENT_INFO.value] = merged.model_dump(mode="json")
+    return config_data
 
 
 router = APIRouter(prefix="/mcp")
@@ -187,13 +286,19 @@ class OnyxTokenStorage(TokenStorage):
                 "Authorization": f"{tokens.token_type} {tokens.access_token}"
             }
             update_connection_config(config.id, db_session, config_data)
-            if self.alt_config_id:
-                update_connection_config(self.alt_config_id, db_session, config_data)
 
-                # signal the oauth callback that token exchange is complete
-                r = get_redis_client()
-                r.rpush(key_tokens(str(self.alt_config_id)), tokens.model_dump_json())
-                r.expire(key_tokens(str(self.alt_config_id)), OAUTH_WAIT_SECONDS)
+        # The shared admin row is intentionally NOT written here: it
+        # serves as the OAuth `client_info` registry shared across all
+        # users of this MCP server (see `get_client_info`). Per-user
+        # state (access tokens and resolved `Authorization` headers)
+        # belongs only on the per-user row. The Redis push below is
+        # what `process_oauth_callback` blocks on to know token exchange
+        # has completed; the admin config id is the only stable
+        # identifier shared between the two contexts.
+        if self.alt_config_id:
+            r = get_redis_client()
+            r.rpush(key_tokens(str(self.alt_config_id)), tokens.model_dump_json())
+            r.expire(key_tokens(str(self.alt_config_id)), OAUTH_WAIT_SECONDS)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         with get_session_with_current_tenant() as db_session:
@@ -218,14 +323,30 @@ class OnyxTokenStorage(TokenStorage):
                         )
             return None
 
-    async def set_client_info(self, info: OAuthClientInformationFull) -> None:
+    async def set_client_info(  # ty: ignore[invalid-method-override]
+        self, info: OAuthClientInformationFull
+    ) -> None:
+        info_payload = info.model_dump(mode="json")
         with get_session_with_current_tenant() as db_session:
             config = self._ensure_connection_config(db_session)
             config_data = extract_connection_data(config)
-            config_data[MCPOAuthKeys.CLIENT_INFO.value] = info.model_dump(mode="json")
+            config_data[MCPOAuthKeys.CLIENT_INFO.value] = info_payload
             update_connection_config(config.id, db_session, config_data)
+
+            # The shared admin row holds the OAuth `client_info` registry
+            # used by every user of this MCP server (see `get_client_info`).
+            # When DCR runs we want to cache the discovered client_info there
+            # so future users can re-use it — but ONLY the `client_info`
+            # field. The per-user `config_data` carries per-user state
+            # (`tokens`, resolved `Authorization` header) which belongs
+            # only on the per-user row.
             if self.alt_config_id:
-                update_connection_config(self.alt_config_id, db_session, config_data)
+                alt_config = get_connection_config_by_id(self.alt_config_id, db_session)
+                alt_config_data = extract_connection_data(alt_config)
+                alt_config_data[MCPOAuthKeys.CLIENT_INFO.value] = info_payload
+                update_connection_config(
+                    self.alt_config_id, db_session, alt_config_data
+                )
 
 
 def make_oauth_provider(
@@ -319,11 +440,10 @@ def _build_headers_from_template(
     template_headers = template_data.headers
 
     for name, value_template in template_headers.items():
-        # Replace placeholders
         value = value_template
         for key, cred_value in credentials.items():
             value = value.replace(f"{{{key}}}", cred_value)
-        value = value.replace("{user_email}", user_email)
+        value = apply_auto_substitutions(value, user_email=user_email)
 
         if name:
             headers[name] = value
@@ -418,8 +538,10 @@ async def _connect_oauth(
             detail=f"Server was configured with authentication type {auth_type_str}",
         )
 
-    # If the frontend sent back masked credentials (unchanged by the user),
-    # restore the real stored values so we don't overwrite them with masks.
+    # Resolve the effective OAuth credentials, falling back to the stored
+    # values for any field the frontend marked as unchanged. This protects
+    # against the resubmit case where the form replays masked placeholders.
+    existing_client: OAuthClientInformationFull | None = None
     if mcp_server.admin_connection_config:
         existing_data = extract_connection_data(
             mcp_server.admin_connection_config, apply_mask=False
@@ -429,31 +551,31 @@ async def _connect_oauth(
             existing_client = OAuthClientInformationFull.model_validate(
                 existing_client_raw
             )
-            (
-                request.oauth_client_id,
-                request.oauth_client_secret,
-            ) = _restore_masked_oauth_credentials(
-                request.oauth_client_id,
-                request.oauth_client_secret,
-                existing_client,
-            )
 
-    # Create admin config with client info if provided
-    config_data = MCPConnectionData(headers={})
-    if request.oauth_client_id and request.oauth_client_secret:
-        client_info = OAuthClientInformationFull(
+    request.oauth_client_id, request.oauth_client_secret = _resolve_oauth_credentials(
+        request_client_id=request.oauth_client_id,
+        request_client_id_changed=request.oauth_client_id_changed,
+        request_client_secret=request.oauth_client_secret,
+        request_client_secret_changed=request.oauth_client_secret_changed,
+        existing_client=existing_client,
+    )
+
+    # When we already have a stored `client_info`, merge into it so we
+    # preserve any provider-managed fields (DCR registration token,
+    # `client_secret_expires_at`, negotiated `token_endpoint_auth_method`,
+    # etc.) that the hardcoded template would otherwise drop.
+    config_data = (
+        _build_oauth_admin_config_data_for_update(
             client_id=request.oauth_client_id,
             client_secret=request.oauth_client_secret,
-            redirect_uris=[AnyUrl(f"{WEB_DOMAIN}/mcp/oauth/callback")],
-            grant_types=["authorization_code", "refresh_token"],
-            response_types=["code"],
-            scope=REQUESTED_SCOPE,  # TODO: allow specifying scopes?
-            # Must specify auth method so client_secret is actually sent during token exchange
-            token_endpoint_auth_method="client_secret_post",
+            existing_client=existing_client,
         )
-        config_data[MCPOAuthKeys.CLIENT_INFO.value] = client_info.model_dump(
-            mode="json"
+        if existing_client is not None
+        else _build_oauth_admin_config_data(
+            client_id=request.oauth_client_id,
+            client_secret=request.oauth_client_secret,
         )
+    )
 
     if mcp_server.admin_connection_config_id is None:
         if not is_admin:
@@ -970,9 +1092,17 @@ def _db_mcp_server_to_api_mcp_server(
                 admin_credentials = {}
                 logger.warning(f"No client info found for server {db_server.name}")
 
-    # Get auth template if this is a per-user auth server
+    # The header template is only meaningful for per-user API_TOKEN
+    # servers, where it surfaces placeholder strings (e.g.
+    # `Bearer {API_KEY}`) for the user-side credential prompt. OAuth
+    # per-user servers do not get an `auth_template`: OAuth uses the
+    # handshake URL (`/oauth/connect`) rather than a header template,
+    # so the frontend never consumes one for OAuth flows.
     auth_template = None
-    if auth_performer == MCPAuthenticationPerformer.PER_USER:
+    if (
+        auth_performer == MCPAuthenticationPerformer.PER_USER
+        and db_server.auth_type != MCPAuthenticationType.OAUTH
+    ):
         try:
             template_config = db_server.admin_connection_config
             if template_config:
@@ -980,9 +1110,15 @@ def _db_mcp_server_to_api_mcp_server(
                     template_config, apply_mask=False
                 )
                 headers = template_config_dict.get("headers", {})
+                # Prefer the explicitly persisted list; fall back to deriving
+                # from header placeholders for servers created before
+                # `required_fields` was persisted.
+                required_fields = template_config_dict.get(
+                    "required_fields"
+                ) or MCPAuthTemplate.derive_required_fields(headers)
                 auth_template = MCPAuthTemplate(
                     headers=headers,
-                    required_fields=[],  # would need to regex, not worth it
+                    required_fields=required_fields,
                 )
         except Exception as e:
             logger.warning(
@@ -1402,17 +1538,20 @@ def _upsert_mcp_server(
             if client_info_raw:
                 client_info = OAuthClientInformationFull.model_validate(client_info_raw)
 
-        # If the frontend sent back masked credentials (unchanged by the user),
-        # restore the real stored values so the comparison below sees no change
-        # and the credentials aren't overwritten with masked strings.
+        # Resolve the effective OAuth credentials, falling back to the stored
+        # values for any field the frontend marked as unchanged. This protects
+        # the change-detection comparison below from spurious diffs caused by
+        # masked placeholders being replayed.
         if client_info and request.auth_type == MCPAuthenticationType.OAUTH:
             (
                 request.oauth_client_id,
                 request.oauth_client_secret,
-            ) = _restore_masked_oauth_credentials(
-                request.oauth_client_id,
-                request.oauth_client_secret,
-                client_info,
+            ) = _resolve_oauth_credentials(
+                request_client_id=request.oauth_client_id,
+                request_client_id_changed=request.oauth_client_id_changed,
+                request_client_secret=request.oauth_client_secret,
+                request_client_secret_changed=request.oauth_client_secret_changed,
+                existing_client=client_info,
             )
 
         changing_connection_config = (
@@ -1522,11 +1661,21 @@ def _upsert_mcp_server(
             # Per-user server: create template and save creator's per-user config
             template_data = request.auth_template
 
+            # Trust the explicit list when present, otherwise derive it from
+            # the header placeholders so the user-side modal always knows
+            # which fields to prompt for. Older servers created before this
+            # field was persisted are healed lazily on read.
+            persisted_required_fields = (
+                template_data.required_fields
+                or MCPAuthTemplate.derive_required_fields(template_data.headers)
+            )
+
             # Create template config: faithful representation of what's in the admin panel
             template_config = create_connection_config(
                 config_data=MCPConnectionData(
                     headers=template_data.headers,
                     header_substitutions=request.admin_credentials,
+                    required_fields=persisted_required_fields,
                 ),
                 mcp_server_id=mcp_server.id,
                 user_email="",
@@ -1551,20 +1700,13 @@ def _upsert_mcp_server(
             # Create initial admin config. If client credentials were provided,
             # seed client_info so the OAuth provider can skip dynamic
             # registration; otherwise, the provider will attempt it.
-            cfg: MCPConnectionData = MCPConnectionData(headers={})
-            if request.oauth_client_id:
-                client_info = OAuthClientInformationFull(
-                    client_id=request.oauth_client_id,
-                    client_secret=request.oauth_client_secret,
-                    redirect_uris=[AnyUrl(f"{WEB_DOMAIN}/mcp/oauth/callback")],
-                    grant_types=["authorization_code", "refresh_token"],
-                    response_types=["code"],
-                    scope=REQUESTED_SCOPE,  # TODO: allow specifying scopes?
-                    # default token_endpoint_auth_method is client_secret_post
-                )
-                cfg[MCPOAuthKeys.CLIENT_INFO.value] = client_info.model_dump(
-                    mode="json"
-                )
+            # NOTE: must go through the shared helper so
+            # `token_endpoint_auth_method` matches what `_connect_oauth`'s
+            # update path expects to preserve later.
+            cfg: MCPConnectionData = _build_oauth_admin_config_data(
+                client_id=request.oauth_client_id,
+                client_secret=request.oauth_client_secret,
+            )
 
             admin_config = create_connection_config(
                 config_data=cfg,
@@ -1661,6 +1803,7 @@ def get_all_mcp_tools(
 ) -> list:
     """Get all tools associated with MCP servers, including both enabled and disabled tools"""
     from sqlalchemy import select
+
     from onyx.db.models import Tool
 
     # Query MCP tools ordered by ID to maintain consistent ordering

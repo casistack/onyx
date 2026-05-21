@@ -25,8 +25,11 @@ from shared_configs.configs import (
     POSTGRES_DEFAULT_SCHEMA,
     TENANT_ID_PREFIX,
 )
+from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 from onyx.db.models import Base
-from celery.backends.database.session import ResultModelBase  # type: ignore
+from celery.backends.database.session import (  # ty: ignore[unresolved-import]
+    ResultModelBase,
+)
 from onyx.db.engine.sql_engine import SqlEngine
 
 # Make sure in alembic.ini [logger_root] level=INFO is set or most logging will be
@@ -208,7 +211,7 @@ def do_run_migrations(
 
     context.configure(
         connection=connection,
-        target_metadata=target_metadata,  # type: ignore
+        target_metadata=target_metadata,
         version_table_schema=schema_name,
         include_schemas=True,
         compare_type=True,
@@ -216,8 +219,15 @@ def do_run_migrations(
         script_location=config.get_main_option("script_location"),
     )
 
-    with context.begin_transaction():
-        context.run_migrations()
+    # Migrations may call into code that reads CURRENT_TENANT_ID_CONTEXTVAR
+    # (e.g. get_kv_store().load() in 4ee1287bd26a). search_path alone is not
+    # enough — set the Python contextvar to match.
+    token = CURRENT_TENANT_ID_CONTEXTVAR.set(schema_name)
+    try:
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
 
 
 def provide_iam_token_for_alembic(
@@ -380,7 +390,7 @@ def run_migrations_offline() -> None:
             logger.info(f"Migrating schema: {schema}")
             context.configure(
                 url=url,
-                target_metadata=target_metadata,  # type: ignore
+                target_metadata=target_metadata,
                 literal_binds=True,
                 version_table_schema=schema,
                 include_schemas=True,
@@ -421,7 +431,7 @@ def run_migrations_offline() -> None:
             logger.info(f"Migrating schema: {schema}")
             context.configure(
                 url=url,
-                target_metadata=target_metadata,  # type: ignore
+                target_metadata=target_metadata,
                 literal_binds=True,
                 version_table_schema=schema,
                 include_schemas=True,
@@ -464,7 +474,7 @@ def run_migrations_online() -> None:
 
             context.configure(
                 connection=connection,
-                target_metadata=target_metadata,  # type: ignore
+                target_metadata=target_metadata,
                 version_table_schema=schema_name,
                 include_schemas=True,
                 compare_type=True,

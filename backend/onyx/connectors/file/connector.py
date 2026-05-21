@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime
 from datetime import timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from typing import IO
@@ -12,11 +13,16 @@ from onyx.configs.constants import FileOrigin
 from onyx.connectors.cross_connector_utils.miscellaneous_utils import (
     process_onyx_metadata,
 )
+from onyx.connectors.cross_connector_utils.tabular_section_utils import is_tabular_file
+from onyx.connectors.cross_connector_utils.tabular_section_utils import (
+    tabular_file_to_sections,
+)
 from onyx.connectors.interfaces import GenerateDocumentsOutput
 from onyx.connectors.interfaces import LoadConnector
 from onyx.connectors.models import Document
 from onyx.connectors.models import HierarchyNode
 from onyx.connectors.models import ImageSection
+from onyx.connectors.models import TabularSection
 from onyx.connectors.models import TextSection
 from onyx.file_processing.extract_file_text import extract_text_and_images
 from onyx.file_processing.extract_file_text import get_file_ext
@@ -24,7 +30,6 @@ from onyx.file_processing.file_types import OnyxFileExtensions
 from onyx.file_processing.image_utils import store_image_and_create_section
 from onyx.file_store.file_store import get_default_file_store
 from onyx.utils.logger import setup_logger
-
 
 logger = setup_logger()
 
@@ -179,8 +184,46 @@ def _process_file(
         link = onyx_metadata.link or link
 
     # Build sections: first the text as a single Section
-    sections: list[TextSection | ImageSection] = []
-    if extraction_result.text_content.strip():
+    sections: list[TextSection | ImageSection | TabularSection] = []
+    # `Document.file_id` doubles as the "stage these bytes into the
+    # code-interpreter sandbox" signal read by
+    # `build_python_chat_files_from_search_docs`, which has no tabular
+    # gate of its own — stamping every file would auto-stage every cited
+    # PDF/TXT/DOCX. Trade-off: non-tabular uploads keep
+    # `Document.file_id=NULL`, forcing `_user_can_access_connector_file`
+    # into a JSONB scan (see TODO there).
+    # TODO: stamp `Document.file_id` unconditionally here and add the
+    # tabular check to `build_python_chat_files_from_search_docs` (keyed
+    # off `FileRecord.display_name`). Combined with a backfill, that lets
+    # us drop the JSONB fallback entirely.
+    doc_file_id = None
+    if is_tabular_file(file_name):
+        doc_file_id = file_id
+
+        # Produce TabularSections
+        lowered_name = file_name.lower()
+        if lowered_name.endswith(tuple(OnyxFileExtensions.SPREADSHEET_EXTENSIONS)):
+            file.seek(0)
+            tabular_source: IO[bytes] = file
+        else:
+            tabular_source = BytesIO(
+                extraction_result.text_content.encode("utf-8", errors="replace")
+            )
+        try:
+            sections.extend(
+                tabular_file_to_sections(
+                    file=tabular_source,
+                    file_name=file_name,
+                    link=link or "",
+                )
+            )
+        except Exception as e:
+            logger.error(f"Failed to process tabular file {file_name}: {e}")
+            return []
+        if not sections:
+            logger.warning(f"No content extracted from tabular file {file_name}")
+            return []
+    elif extraction_result.text_content.strip():
         logger.debug(f"Creating TextSection for {file_name} with link: {link}")
         sections.append(
             TextSection(link=link, text=extraction_result.text_content.strip())
@@ -220,6 +263,7 @@ def _process_file(
             primary_owners=primary_owners,
             secondary_owners=secondary_owners,
             metadata=custom_tags,
+            file_id=doc_file_id,
         )
     ]
 

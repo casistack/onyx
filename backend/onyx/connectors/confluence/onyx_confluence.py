@@ -26,7 +26,8 @@ from typing import TypeVar
 from urllib.parse import quote
 
 import bs4
-from atlassian import Confluence  # type:ignore
+import requests
+from atlassian import Confluence
 from redis import Redis
 from requests import HTTPError
 
@@ -42,6 +43,7 @@ from onyx.connectors.confluence.utils import confluence_refresh_tokens
 from onyx.connectors.confluence.utils import get_start_param_from_url
 from onyx.connectors.confluence.utils import update_param_in_path
 from onyx.connectors.cross_connector_utils.miscellaneous_utils import scoped_url
+from onyx.connectors.exceptions import ConnectorValidationError
 from onyx.connectors.interfaces import CredentialsProviderInterface
 from onyx.file_processing.html_utils import format_document_soup
 from onyx.redis.redis_pool import get_redis_client
@@ -61,9 +63,25 @@ _USER_NOT_FOUND = "Unknown Confluence User"
 _USER_ID_TO_DISPLAY_NAME_CACHE: dict[str, str | None] = {}
 _USER_EMAIL_CACHE: dict[str, str | None] = {}
 _DEFAULT_PAGINATION_LIMIT = 1000
+_MINIMUM_PAGINATION_LIMIT = 5
+
+_SERVER_ERROR_CODES = {500, 502, 503, 504}
 
 _CONFLUENCE_SPACES_API_V1 = "rest/api/space"
 _CONFLUENCE_SPACES_API_V2 = "wiki/api/v2/spaces"
+
+# Atlassian KB documenting how Secure Administrator Sessions (WebSudo) breaks
+# admin JSON-RPC calls. Surfaced in the validation error so admins can act on
+# it without our help.
+_WEBSUDO_KB_URL = (
+    "https://support.atlassian.com/confluence/kb/"
+    "json-rpc-api-request-returns-websudorequiredexception-on-confluence/"
+)
+# Cap how much of an unparseable JSON-RPC response body we put in the error
+# message. WebSudo / login HTML pages are well under this; the cap is a
+# defense against a runaway response (e.g. a multi-MB error page) ending up
+# in our logs and validation surface.
+_JSONRPC_ERROR_BODY_SNIPPET_CHARS = 1000
 
 
 class ConfluenceRateLimitError(Exception):
@@ -569,7 +587,8 @@ class OnyxConfluence:
         if not limit:
             limit = _DEFAULT_PAGINATION_LIMIT
 
-        url_suffix = update_param_in_path(url_suffix, "limit", str(limit))
+        current_limit = limit
+        url_suffix = update_param_in_path(url_suffix, "limit", str(current_limit))
 
         while url_suffix:
             logger.debug(f"Making confluence call to {url_suffix}")
@@ -609,39 +628,60 @@ class OnyxConfluence:
                     )
                     continue
 
-                # If we fail due to a 500, try one by one.
-                # NOTE: this iterative approach only works for server, since cloud uses cursor-based
-                # pagination
-                if raw_response.status_code == 500 and not self._is_cloud:
-                    initial_start = get_start_param_from_url(url_suffix)
-                    if initial_start is None:
-                        # can't handle this if we don't have offset-based pagination
-                        raise
+                if raw_response.status_code in _SERVER_ERROR_CODES:
+                    # Try reducing the page size -- Confluence often times out
+                    # on large result sets (especially Cloud 504s).
+                    if current_limit > _MINIMUM_PAGINATION_LIMIT:
+                        old_limit = current_limit
+                        current_limit = max(
+                            current_limit // 2, _MINIMUM_PAGINATION_LIMIT
+                        )
+                        logger.warning(
+                            f"Confluence returned {raw_response.status_code}. "
+                            f"Reducing limit from {old_limit} to {current_limit} "
+                            f"and retrying."
+                        )
+                        url_suffix = update_param_in_path(
+                            url_suffix, "limit", str(current_limit)
+                        )
+                        continue
 
-                    # this will just yield the successful items from the batch
-                    new_url_suffix = yield from self._try_one_by_one_for_paginated_url(
-                        url_suffix,
-                        initial_start=initial_start,
-                        limit=limit,
-                    )
+                    # Limit reduction exhausted -- for Server, fall back to
+                    # one-by-one offset pagination as a last resort.
+                    if not self._is_cloud:
+                        initial_start = get_start_param_from_url(url_suffix)
+                        # this will just yield the successful items from the batch
+                        new_url_suffix = (
+                            yield from self._try_one_by_one_for_paginated_url(
+                                url_suffix,
+                                initial_start=initial_start,
+                                limit=current_limit,
+                            )
+                        )
+                        # this means we ran into an empty page
+                        if new_url_suffix is None:
+                            if next_page_callback:
+                                next_page_callback("")
+                            break
 
-                    # this means we ran into an empty page
-                    if new_url_suffix is None:
-                        if next_page_callback:
-                            next_page_callback("")
-                        break
+                        url_suffix = new_url_suffix
+                        continue
 
-                    url_suffix = new_url_suffix
-                    continue
-
-                else:
                     logger.exception(
-                        f"Error in confluence call to {url_suffix} \n"
-                        f"Raw Response Text: {raw_response.text} \n"
-                        f"Full Response: {raw_response.__dict__} \n"
-                        f"Error: {e} \n"
+                        f"Error in confluence call to {url_suffix} "
+                        f"after reducing limit to {current_limit}.\n"
+                        f"Raw Response Text: {raw_response.text}\n"
+                        f"Error: {e}\n"
                     )
                     raise
+
+                logger.exception(
+                    f"Error in confluence call to {url_suffix} \n"
+                    f"Raw Response Text: {raw_response.text} \n"
+                    f"Full Response: {raw_response.__dict__} \n"
+                    f"Error: {e} \n"
+                )
+                raise
 
             try:
                 next_response = raw_response.json()
@@ -680,6 +720,10 @@ class OnyxConfluence:
             old_url_suffix = url_suffix
             updated_start = get_start_param_from_url(old_url_suffix)
             url_suffix = cast(str, next_response.get("_links", {}).get("next", ""))
+            if url_suffix and current_limit != limit:
+                url_suffix = update_param_in_path(
+                    url_suffix, "limit", str(current_limit)
+                )
             for i, result in enumerate(results):
                 updated_start += 1
                 if url_suffix and next_page_callback and i == len(results) - 1:
@@ -894,16 +938,35 @@ class OnyxConfluence:
         space_key: str,
     ) -> list[dict[str, Any]]:
         """
-        This is a confluence server/data center specific method that can be used to
-        fetch the permissions of a space.
+        Fetches a space's permissions via the legacy JSON-RPC API.
 
-        NOTE: This uses the JSON-RPC API which is the ONLY way to get space permissions
-        on Confluence Server/Data Center. The REST API equivalent (expand=permissions)
-        is Cloud-only and not available on Data Center as of version 8.9.x.
+        This is the only space-permissions API available on Confluence Data
+        Center < 9.1.0. DC 9.1.0+ ships a proper REST API at
+        /rest/api/space/{spaceKey}/permissions (CONFSERVER-78176) which is
+        preferred wherever available; this method is the fallback for older
+        Server / Data Center deployments.
 
-        If this fails with 401 Unauthorized, the customer needs to enable JSON-RPC:
-        Confluence Admin -> General Configuration -> Further Configuration
-        -> Enable "Remote API (XML-RPC & SOAP)"
+        Failure modes handled here:
+
+        - HTTP 401: the JSON-RPC plugin is disabled. Confluence Admin ->
+          General Configuration -> Further Configuration -> Enable
+          "Remote API (XML-RPC & SOAP)".
+        - HTTP 200 with a non-JSON body (Confluence 7.7+): "Secure
+          Administrator Sessions" / WebSudo is intercepting admin JSON-RPC
+          calls and serving the login HTML or a WebSudoRequiredException
+          page instead of a JSON-RPC envelope. We surface the actual HTTP
+          status, Content-Type, and a body snippet so the admin can confirm
+          which of the documented failure modes they're hitting (rather
+          than guessing) and act on it.
+
+        We use atlassian-python-api's `advanced_mode=True` to get the raw
+        requests.Response back. Without it, the library's _response_handler
+        catches the JSON parse error and silently coerces the body to None,
+        which throws away every signal we'd need to debug the failure.
+        Trade-off: the library no longer raises HTTPError on 4xx/5xx in
+        advanced mode, so this call no longer benefits from the
+        __getattr__ wrapper's retry-on-5xx; we call raise_for_status
+        ourselves to preserve the "blow up on server error" behavior.
         """
         url = "rpc/json-rpc/confluenceservice-v2"
         data = {
@@ -912,25 +975,47 @@ class OnyxConfluence:
             "id": 7,
             "params": [space_key],
         }
+        response: requests.Response = self.post(url, data=data, advanced_mode=True)
+
+        if response.status_code == 401:
+            raise HTTPError(
+                "Unauthorized (401) when calling JSON-RPC API for space permissions. "
+                "This is likely because the Remote API is disabled. "
+                "To fix: Confluence Admin -> General Configuration -> Further Configuration "
+                "-> Enable 'Remote API (XML-RPC & SOAP)'",
+                response=response,
+            )
+        response.raise_for_status()
+
         try:
-            response = self.post(url, data=data)
-        except HTTPError as e:
-            if e.response is not None and e.response.status_code == 401:
-                raise HTTPError(
-                    "Unauthorized (401) when calling JSON-RPC API for space permissions. "
-                    "This is likely because the Remote API is disabled. "
-                    "To fix: Confluence Admin -> General Configuration -> Further Configuration "
-                    "-> Enable 'Remote API (XML-RPC & SOAP)'",
-                    response=e.response,
-                ) from e
-            raise
-        logger.debug(f"jsonrpc response: {response}")
-        if not response.get("result"):
-            logger.warning(
-                f"No jsonrpc response for space permissions for space {space_key}\nResponse: {response}"
+            payload = response.json()
+        except ValueError:
+            content_type = response.headers.get("Content-Type", "<unset>")
+            body_snippet = response.text[:_JSONRPC_ERROR_BODY_SNIPPET_CHARS]
+            raise ConnectorValidationError(
+                f"Confluence JSON-RPC returned a non-JSON response for space "
+                f"'{space_key}' (HTTP {response.status_code}, "
+                f"Content-Type={content_type}). This typically happens on "
+                "Confluence Server / Data Center 7.7+ when 'Secure "
+                "Administrator Sessions' (WebSudo) intercepts admin JSON-RPC "
+                "calls. To fix, either (1) disable Secure Administrator "
+                "Sessions in General Configuration -> Security Configuration, "
+                "or (2) upgrade to Confluence Data Center 9.1+ where the REST "
+                f"space-permissions API replaces JSON-RPC. See "
+                f"{_WEBSUDO_KB_URL}\n"
+                f"Response body (first {_JSONRPC_ERROR_BODY_SNIPPET_CHARS} "
+                f"chars): {body_snippet!r}"
             )
 
-        return response.get("result", [])
+        logger.debug("jsonrpc response: %s", payload)
+        if not payload.get("result"):
+            logger.warning(
+                "No jsonrpc response for space permissions for space %s\nResponse: %s",
+                space_key,
+                payload,
+            )
+
+        return payload.get("result", [])
 
     def get_current_user(self, expand: str | None = None) -> Any:
         """
@@ -942,7 +1027,7 @@ class OnyxConfluence:
         :return: Returns the user details
         """
 
-        from atlassian.errors import ApiPermissionError  # type:ignore
+        from atlassian.errors import ApiPermissionError
 
         url = "rest/api/user/current"
         params = {}
@@ -1042,6 +1127,9 @@ def extract_text_from_confluence_html(
     soup = bs4.BeautifulSoup(object_html, "html.parser")
 
     _remove_macro_stylings(soup=soup)
+
+    for date_span in soup.findAll("span", {"class": "date-lozenger-container"}):
+        date_span.replaceWith(date_span.get_text())
 
     for user in soup.findAll("ri:user"):
         user_id = (

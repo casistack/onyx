@@ -7,7 +7,7 @@ from typing import Dict
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-from googleapiclient.errors import HttpError  # type: ignore
+from googleapiclient.errors import HttpError
 
 from onyx.access.models import ExternalAccess
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
@@ -47,7 +47,6 @@ from onyx.connectors.models import TextSection
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
 from onyx.utils.retry_wrapper import retry_builder
-
 
 logger = setup_logger()
 
@@ -306,7 +305,9 @@ def _full_thread_from_id(
     try:
         thread = next(
             execute_single_retrieval(
-                retrieval_function=gmail_service.users().threads().get,
+                retrieval_function=gmail_service.users()  # ty: ignore[unresolved-attribute]
+                .threads()
+                .get,
                 list_key=None,
                 userId=user_email,
                 fields=THREAD_FIELDS,
@@ -404,7 +405,7 @@ class GmailConnector(
             admin_service = get_admin_service(self.creds, self.primary_admin_email)
             emails = []
             for user in execute_paginated_retrieval(
-                retrieval_function=admin_service.users().list,
+                retrieval_function=admin_service.users().list,  # ty: ignore[unresolved-attribute]
                 list_key="users",
                 fields=USER_FIELDS,
                 domain=self.google_domain,
@@ -448,7 +449,9 @@ class GmailConnector(
         try:
             for thread in execute_paginated_retrieval_with_max_pages(
                 max_num_pages=PAGES_PER_CHECKPOINT,
-                retrieval_function=gmail_service.users().threads().list,
+                retrieval_function=gmail_service.users()  # ty: ignore[unresolved-attribute]
+                .threads()
+                .list,
                 list_key="threads",
                 userId=user_email,
                 fields=THREAD_LIST_FIELDS,
