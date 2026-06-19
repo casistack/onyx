@@ -146,8 +146,7 @@ def get_all_users(
         User.email != ANONYMOUS_USER_EMAIL  # ty: ignore[invalid-argument-type]
     )
     stmt = stmt.where(
-        User.email
-        != NO_AUTH_PLACEHOLDER_USER_EMAIL  # ty: ignore[invalid-argument-type]
+        User.email != NO_AUTH_PLACEHOLDER_USER_EMAIL  # ty: ignore[invalid-argument-type]
     )
 
     if not include_external:
@@ -503,7 +502,9 @@ def assign_user_to_default_groups__no_commit(
 
     recompute_user_permissions__no_commit(user.id, db_session)
 
-    logger.info(f"Assigned user {user.email} to default group '{default_group.name}'")
+    logger.info(
+        "Assigned user %s to default group '%s'", user.email, default_group.name
+    )
 
 
 def delete_user_from_db(

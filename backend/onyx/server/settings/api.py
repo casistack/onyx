@@ -30,13 +30,17 @@ from onyx.server.settings.models import (
 from onyx.server.settings.models import DEFAULT_FILE_TOKEN_COUNT_THRESHOLD_K_VECTOR_DB
 from onyx.server.settings.models import Notification
 from onyx.server.settings.models import Settings
+from onyx.server.settings.models import Tier
 from onyx.server.settings.models import UserSettings
 from onyx.server.settings.store import load_settings
 from onyx.server.settings.store import store_settings
+from onyx.server.settings.tier_order import tier_at_least
 from onyx.utils.logger import setup_logger
+from onyx.utils.platform_utils import is_running_in_container
 from onyx.utils.variable_functionality import (
     fetch_versioned_implementation_with_fallback,
 )
+from onyx.utils.variable_functionality import global_version
 from shared_configs.configs import MULTI_TENANT
 
 logger = setup_logger()
@@ -59,6 +63,34 @@ def admin_put_settings(
             OnyxErrorCode.INVALID_INPUT,
             f"File upload size limit cannot exceed {MAX_ALLOWED_UPLOAD_SIZE_MB} MB",
         )
+
+    if global_version.is_ee_version():
+        from ee.onyx.utils.tier import get_tier
+
+        current_tier = get_tier()
+    else:
+        current_tier = Tier.COMMUNITY
+    existing = load_settings()
+    # Search Mode is Business+; Chat Retention is Enterprise-only.
+    # Use the same error code (FEATURE_NOT_AVAILABLE / 402) the tier_gate
+    # middleware uses, so the FE has one shape to handle for tier-rejected
+    # writes.
+    if settings.search_ui_enabled != existing.search_ui_enabled and not tier_at_least(
+        current_tier, Tier.BUSINESS
+    ):
+        raise OnyxError(
+            OnyxErrorCode.FEATURE_NOT_AVAILABLE,
+            "Search Mode requires the Business or Enterprise plan.",
+        )
+    if (
+        settings.maximum_chat_retention_days != existing.maximum_chat_retention_days
+        and not tier_at_least(current_tier, Tier.ENTERPRISE)
+    ):
+        raise OnyxError(
+            OnyxErrorCode.FEATURE_NOT_AVAILABLE,
+            "Chat history retention requires the Enterprise plan.",
+        )
+
     store_settings(settings)
 
 
@@ -93,11 +125,17 @@ def fetch_settings(
     # Check if Onyx Craft is enabled for this user (used for server-side redirects)
     onyx_craft_enabled_for_user = is_onyx_craft_enabled(user) if user else False
 
+    # Dev/debug flag: tail-the-pod-logs button gated by an env var. Same
+    # check happens on the SSE endpoint so flipping the env var off
+    # immediately closes the surface, not just the UI.
+    from onyx.server.features.build.configs import ENABLE_OPENCODE_DEBUGGING
+
     return UserSettings(
         **general_settings.model_dump(),
         notifications=settings_notifications,
         needs_reindexing=needs_reindexing,
         onyx_craft_enabled=onyx_craft_enabled_for_user,
+        opencode_debugging_enabled=ENABLE_OPENCODE_DEBUGGING,
         vector_db_enabled=not DISABLE_VECTOR_DB,
         hooks_enabled=not MULTI_TENANT,
         version=onyx_version,
@@ -111,6 +149,7 @@ def fetch_settings(
             if DISABLE_VECTOR_DB
             else DEFAULT_FILE_TOKEN_COUNT_THRESHOLD_K_VECTOR_DB
         ),
+        is_containerized=is_running_in_container(),
     )
 
 

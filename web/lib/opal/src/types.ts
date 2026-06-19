@@ -82,6 +82,50 @@ export type ExtremaSizeVariants = Extract<SizeVariants, "fit" | "full">;
 export type OverridableExtremaSizeVariants = ExtremaSizeVariants | number;
 
 // ---------------------------------------------------------------------------
+// Orientation Variants
+// ---------------------------------------------------------------------------
+
+/** Axis orientation — `"horizontal"` or `"vertical"`. */
+export type OrientationVariants = "horizontal" | "vertical";
+
+// ---------------------------------------------------------------------------
+// Border Variants
+// ---------------------------------------------------------------------------
+
+/**
+ * Border style variants shared across card-like surfaces.
+ *
+ * - `"none"`: no border.
+ * - `"dashed"`: dashed border.
+ * - `"solid"`: solid border.
+ */
+export type BorderVariants = "none" | "dashed" | "solid";
+
+/**
+ * Background fill variants shared across card-like surfaces.
+ *
+ * - `"none"`: transparent background.
+ * - `"light"`: lightly tinted background.
+ * - `"heavy"`: heavily tinted background.
+ */
+export type BackgroundVariants = "none" | "light" | "heavy";
+
+// ---------------------------------------------------------------------------
+// Color Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Semantic color roles used across the design system for foreground, border,
+ * and other colorable surfaces.
+ *
+ * - `"default"` — standard text/border color (`text-04` / `border-01`)
+ * - `"muted"` — de-emphasized color (`text-03`)
+ * - `"danger"` — destructive / error state
+ * - `"interactive"` — follows the interactive coloring system (`currentColor` / `--interactive-foreground`)
+ */
+export type ColorTypes = "default" | "muted" | "danger" | "interactive";
+
+// ---------------------------------------------------------------------------
 // Status Variants
 // ---------------------------------------------------------------------------
 
@@ -150,6 +194,26 @@ export interface RichStr {
   readonly __brand: "RichStr";
   readonly raw: string;
 }
+
+// ---------------------------------------------------------------------------
+// Input Variants
+// ---------------------------------------------------------------------------
+
+/**
+ * Visual state variants for text input components.
+ *
+ * - `"primary"` — default editable state
+ * - `"internal"` — subtle/borderless style for inline use
+ * - `"error"` — error state with red border
+ * - `"disabled"` — non-interactive, grayed out
+ * - `"readOnly"` — visually transparent, not editable
+ */
+export type InputVariants =
+  | "primary"
+  | "internal"
+  | "error"
+  | "disabled"
+  | "readOnly";
 
 /**
  * HTML button `type` attribute values.

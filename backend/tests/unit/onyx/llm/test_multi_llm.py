@@ -101,9 +101,9 @@ def _accumulate_stream_to_assistant_message(
                     if tool_call_delta.function.name:
                         tool_calls_map[index]["name"] = tool_call_delta.function.name
                     if tool_call_delta.function.arguments:
-                        tool_calls_map[index][
-                            "arguments"
-                        ] += tool_call_delta.function.arguments
+                        tool_calls_map[index]["arguments"] += (
+                            tool_call_delta.function.arguments
+                        )
 
     # Convert accumulated tool calls to ToolCall list, sorted by index
     tool_calls = None
@@ -437,6 +437,11 @@ ANTHROPIC_MODELS_OMITTING_SAMPLING_PARAMS = [
     "claude-opus-4.8",
     "claude-4-8-opus",
     "claude-4.8-opus",
+    "claude-fable-5",
+    "claude-fable-5@20260101",
+    "claude-5-fable",
+    "claude-mythos-5",
+    "claude-5-mythos",
 ]
 
 
@@ -463,8 +468,24 @@ def test_omits_temperature_for_no_sampling_params_models(model_name: str) -> Non
         assert "temperature" not in kwargs
 
 
-@pytest.mark.parametrize("model_name", ["claude-opus-4-7", "claude-opus-4-8"])
-def test_claude_adaptive_thinking_uses_output_config(model_name: str) -> None:
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-fable-5",
+        "claude-5-fable",
+        "claude-mythos-5",
+        "claude-5-mythos",
+    ],
+)
+@pytest.mark.parametrize(
+    "reasoning_effort, expected_effort",
+    [(ReasoningEffort.AUTO, "medium"), (ReasoningEffort.HIGH, "high")],
+)
+def test_claude_adaptive_thinking_uses_output_config(
+    model_name: str, reasoning_effort: ReasoningEffort, expected_effort: str
+) -> None:
     # Non-Vertex providers must use the adaptive thinking API for these models
     # (thinking.type=adaptive + output_config.effort) rather than the legacy
     # thinking.type.enabled + budget_tokens path, which they reject with a 400.
@@ -486,11 +507,11 @@ def test_claude_adaptive_thinking_uses_output_config(model_name: str) -> None:
         mock_completion.return_value = []
 
         messages: LanguageModelInput = [UserMessage(content="Hi")]
-        list(llm.stream(messages, reasoning_effort=ReasoningEffort.HIGH))
+        list(llm.stream(messages, reasoning_effort=reasoning_effort))
 
         kwargs = mock_completion.call_args.kwargs
         assert kwargs["thinking"] == {"type": "adaptive"}
-        assert "output_config" in kwargs
+        assert kwargs["output_config"] == {"effort": expected_effort}
         assert "budget_tokens" not in kwargs["thinking"]
 
 
@@ -1541,9 +1562,9 @@ def test_no_tool_choice_sent_when_no_tools(default_multi_llm: LitellmLLM) -> Non
         default_multi_llm.invoke(messages, tools=None)
 
         _, kwargs = mock_completion.call_args
-        assert (
-            "tool_choice" not in kwargs
-        ), "tool_choice must not be sent to providers when no tools are provided"
+        assert "tool_choice" not in kwargs, (
+            "tool_choice must not be sent to providers when no tools are provided"
+        )
 
 
 def test_bifrost_normalizes_api_base_in_model_kwargs() -> None:

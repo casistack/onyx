@@ -177,7 +177,9 @@ class MCPTool(Tool[None]):
                 ]
                 if denylisted_provided:
                     logger.warning(
-                        f"MCP tool '{self._name}' received denylisted headers that were filtered: {denylisted_provided}"
+                        "MCP tool '%s' received denylisted headers that were filtered: %s",
+                        self._name,
+                        denylisted_provided,
                     )
 
             # Priority 2: Base headers from connection config (DB) - overrides request
@@ -211,7 +213,8 @@ class MCPTool(Tool[None]):
                     f"using this tool."
                 )
                 logger.warning(
-                    f"Authentication required for MCP tool '{self._name}' but no credentials found"
+                    "Authentication required for MCP tool '%s' but no credentials found",
+                    self._name,
                 )
 
                 error_result = {"error": auth_error_msg}
@@ -248,9 +251,8 @@ class MCPTool(Tool[None]):
             ):
                 if self.mcp_server.transport == MCPTransport.SSE:
                     logger.warning(
-                        f"MCP tool '{self._name}': OAuth token refresh is not supported "
-                        f"for SSE transport — auth provider will be ignored. "
-                        f"Re-authentication may be required after token expiry."
+                        "MCP tool '%s': OAuth token refresh is not supported for SSE transport — auth provider will be ignored. Re-authentication may be required after token expiry.",
+                        self._name,
                     )
                 else:
                     from onyx.server.features.mcp.api import make_oauth_provider
@@ -276,7 +278,7 @@ class MCPTool(Tool[None]):
                 auth=auth,
             )
 
-            logger.info(f"MCP tool '{self._name}' executed successfully")
+            logger.info("MCP tool '%s' executed successfully", self._name)
 
             # Format the tool result for response
             tool_result_dict = {"tool_result": tool_result}
@@ -305,7 +307,7 @@ class MCPTool(Tool[None]):
 
         except Exception as e:
             error_str = str(e).lower()
-            logger.error(f"Failed to execute MCP tool '{self._name}': {e}")
+            logger.error("Failed to execute MCP tool '%s': %s", self._name, e)
 
             # Check for authentication-related errors
             auth_error_indicators = [

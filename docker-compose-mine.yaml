@@ -11,10 +11,10 @@ x-onyx-common-env: &onyx-common-env
   POSTGRES_HOST: relational_db
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
-  VESPA_HOST: index
   OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
   OPENSEARCH_ADMIN_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:?required}
   ENABLE_OPENSEARCH_INDEXING_FOR_ONYX: ${OPENSEARCH_FOR_ONYX_ENABLED:-true}
+  ONYX_DISABLE_VESPA: ${ONYX_DISABLE_VESPA:-true}
   REDIS_HOST: cache
   MODEL_SERVER_HOST: ${MODEL_SERVER_HOST:-inference_model_server}
   CODE_INTERPRETER_BASE_URL: ${CODE_INTERPRETER_BASE_URL:-http://code-interpreter:8000}
@@ -46,8 +46,6 @@ services:
     depends_on:
       relational_db:
         condition: service_healthy
-      index:
-        condition: service_started
       opensearch:
         condition: service_started
       cache:
@@ -87,8 +85,6 @@ services:
     depends_on:
       relational_db:
         condition: service_healthy
-      index:
-        condition: service_started
       opensearch:
         condition: service_started
       cache:
@@ -207,21 +203,8 @@ services:
       timeout: 5s
       retries: 5
 
-  index:
-    image: ${VESPA_IMAGE:-vespaengine/vespa:8.609.39}
-    restart: unless-stopped
-    environment:
-      VESPA_SKIP_UPGRADE_CHECK: ${VESPA_SKIP_UPGRADE_CHECK:-true}
-    volumes:
-      - vespa_volume:/opt/vespa/var
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "6"
-
   opensearch:
-    image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.4.0}
+    image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.6.0}
     restart: unless-stopped
     environment:
       - discovery.type=single-node
@@ -277,7 +260,6 @@ services:
 
 volumes:
   db_volume:
-  vespa_volume:
   minio_data:
   model_cache_huggingface:
   indexing_huggingface_model_cache:

@@ -8,7 +8,7 @@ import { ChatSession } from "@/app/app/interfaces";
 import ConfirmationModalLayout from "@/refresh-components/layouts/ConfirmationModalLayout";
 import { noProp } from "@/lib/utils";
 import { cn } from "@opal/utils";
-import Popover, { PopoverMenu } from "@/refresh-components/Popover";
+import { Popover, PopoverMenu } from "@opal/components";
 import { useAppRouter } from "@/hooks/appNavigation";
 import {
   Project,
@@ -16,12 +16,12 @@ import {
   createProject as createProjectService,
 } from "@/app/app/projects/projectsService";
 import { useProjectsContext } from "@/providers/ProjectsContext";
-import MoveCustomAgentChatModal from "@/components/modals/MoveCustomAgentChatModal";
+import MoveCustomAgentChatModal from "@/sections/modals/MoveCustomAgentChatModal";
 import { UNNAMED_CHAT } from "@/lib/constants";
 import ShareChatSessionModal from "@/sections/modals/ShareChatSessionModal";
 import { Button, LineItemButton, SidebarTab } from "@opal/components";
 import IconButton from "@/refresh-components/buttons/IconButton";
-import InputTypeIn from "@/refresh-components/inputs/InputTypeIn";
+import { InputTypeIn } from "@opal/components";
 import { DRAG_TYPES, LOCAL_STORAGE_KEYS } from "@/sections/sidebar/constants";
 import {
   shouldShowMoveModal,
@@ -41,7 +41,7 @@ import {
   SvgTrash,
 } from "@opal/icons";
 import useOnMount from "@/hooks/useOnMount";
-import { useAgents, usePinnedAgents } from "@/hooks/useAgents";
+import { useAgents, usePinnedAgents } from "@/lib/agents/hooks";
 
 export interface PopoverSearchInputProps {
   setShowMoveOptions: (show: boolean) => void;

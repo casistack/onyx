@@ -9,11 +9,13 @@ import os
 import queue
 import re
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import Token
+from enum import Enum
 from typing import Final
 from uuid import UUID
 
@@ -57,13 +59,12 @@ from onyx.chat.stop_signal_checker import is_connected as check_stop_signal
 from onyx.chat.stop_signal_checker import reset_cancel_status
 from onyx.configs.app_configs import DISABLE_VECTOR_DB
 from onyx.configs.app_configs import INTEGRATION_TESTS_MODE
+from onyx.configs.chat_configs import CHAT_HEARTBEAT_INTERVAL_S
 from onyx.configs.constants import DEFAULT_PERSONA_ID
 from onyx.configs.constants import DocumentSource
 from onyx.configs.constants import MessageType
 from onyx.configs.constants import MilestoneRecordType
-from onyx.configs.llm_configs import get_image_extraction_and_analysis_enabled
 from onyx.context.search.models import BaseFilters
-from onyx.context.search.models import IndexFilters
 from onyx.context.search.models import SearchDoc
 from onyx.db.chat import create_new_chat_message
 from onyx.db.chat import get_chat_session_by_id
@@ -71,6 +72,7 @@ from onyx.db.chat import get_or_create_root_message
 from onyx.db.chat import reserve_message_id
 from onyx.db.chat import reserve_multi_model_message_ids
 from onyx.db.document_set import filter_document_set_names_by_user_access
+from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import HookPoint
 from onyx.db.memory import get_memories
 from onyx.db.models import ChatMessage
@@ -78,20 +80,15 @@ from onyx.db.models import Persona
 from onyx.db.models import User
 from onyx.db.models import UserFile
 from onyx.db.projects import get_user_files_from_project
-from onyx.db.search_settings import get_active_search_settings
 from onyx.db.tools import get_tools
 from onyx.deep_research.dr_loop import run_deep_research_llm_loop
-from onyx.document_index.factory import get_default_document_index
-from onyx.document_index.interfaces import DocumentIndex
-from onyx.document_index.interfaces import VespaChunkRequest
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import log_onyx_error
 from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.extract_file_text import extract_file_text
-from onyx.file_processing.extract_file_text import extract_text_and_images
-from onyx.file_store.file_store import get_default_file_store
 from onyx.file_store.models import ChatFileType
 from onyx.file_store.models import InMemoryChatFile
+from onyx.file_store.utils import get_default_file_store
 from onyx.file_store.utils import load_in_memory_chat_files
 from onyx.file_store.utils import verify_user_files
 from onyx.hooks.executor import execute_hook
@@ -117,6 +114,7 @@ from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import AgentResponseDelta
 from onyx.server.query_and_chat.streaming_models import AgentResponseStart
+from onyx.server.query_and_chat.streaming_models import ChatHeartbeat
 from onyx.server.query_and_chat.streaming_models import CitationInfo
 from onyx.server.query_and_chat.streaming_models import OverallStop
 from onyx.server.query_and_chat.streaming_models import Packet
@@ -132,7 +130,6 @@ from onyx.tools.tool_constructor import SearchToolConfig
 from onyx.utils.logger import setup_logger
 from onyx.utils.telemetry import mt_cloud_telemetry
 from onyx.utils.timing import log_function_time
-from shared_configs.configs import MULTI_TENANT
 from shared_configs.contextvars import get_current_tenant_id
 
 logger = setup_logger()
@@ -325,108 +322,28 @@ def _empty_extracted_context_files() -> ExtractedContextFiles:
     )
 
 
-def _fetch_cached_image_captions(
-    user_file: UserFile | None,
-    document_index: DocumentIndex | None,
-) -> list[str]:
-    """Read image-caption chunks for a user file from the document index.
-
-    During indexing, embedded images are summarized via a vision LLM and
-    those summaries are stored as chunks whose `image_file_id` is set. Reading
-    them back at chat time avoids re-running vision-LLM calls per turn.
-    Returns an empty list if the index has no chunks yet (e.g. indexing is
-    still in flight) or on any fetch failure.
-    """
-    if user_file is None or document_index is None:
-        return []
-    try:
-        chunks = document_index.id_based_retrieval(
-            chunk_requests=[VespaChunkRequest(document_id=str(user_file.id))],
-            filters=IndexFilters(
-                access_control_list=None,
-                tenant_id=get_current_tenant_id() if MULTI_TENANT else None,
-            ),
-        )
-    except Exception:
-        logger.warning(
-            f"Failed to fetch cached captions for user_file {user_file.id}",
-            exc_info=True,
-        )
-        return []
-
-    # An image can be spread across multiple chunks; combine by image_file_id
-    # so a single caption appears once in the context.
-    combined: dict[str, list[str]] = {}
-    for chunk in chunks:
-        if chunk.image_file_id and chunk.content:
-            combined.setdefault(chunk.image_file_id, []).append(chunk.content)
-    return [
-        f"[Image — {image_file_id}]\n" + "\n".join(contents)
-        for image_file_id, contents in combined.items()
-    ]
-
-
-def _extract_text_from_in_memory_file(
-    f: InMemoryChatFile,
-    user_file: UserFile | None = None,
-    document_index: DocumentIndex | None = None,
-) -> str | None:
+def _extract_text_from_in_memory_file(f: InMemoryChatFile) -> str | None:
     """Extract text content from an InMemoryChatFile.
 
     PLAIN_TEXT: the content is pre-extracted UTF-8 plaintext stored during
     ingestion — decode directly.
     DOC / CSV / other text types: the content is the original file bytes —
     use extract_file_text which handles encoding detection and format parsing.
-    When image extraction is enabled and the file has embedded images, cached
-    captions are pulled from the document index and appended to the text.
-    The index fetch is skipped for files with no embedded images. We do not
-    re-summarize images inline here — this path is hot and the indexing
-    pipeline writes chunks atomically, so a missed caption means the file
-    is mid-indexing and will be picked up on the next turn.
+    Embedded-image summaries are only generated at index time; chat-time
+    extraction is text-only and any image context comes through search.
     """
     try:
         if f.file_type == ChatFileType.PLAIN_TEXT:
             return f.content.decode("utf-8", errors="ignore").replace("\x00", "")
 
-        filename = f.filename or ""
-        if not get_image_extraction_and_analysis_enabled():
-            return extract_file_text(
-                file=io.BytesIO(f.content),
-                file_name=filename,
-                break_on_unprocessable=False,
-            )
-
-        extraction = extract_text_and_images(
+        text_content = extract_file_text(
             file=io.BytesIO(f.content),
-            file_name=filename,
+            file_name=f.filename or "",
+            break_on_unprocessable=False,
         )
-        text = extraction.text_content
-        has_text = bool(text.strip())
-        has_images = bool(extraction.embedded_images)
-
-        if not has_text and not has_images:
-            # extract_text_and_images has no is_text_file() fallback for
-            # unknown extensions (.py/.rs/.md without a dedicated handler).
-            # Defer to the legacy path so those files remain readable.
-            return extract_file_text(
-                file=io.BytesIO(f.content),
-                file_name=filename,
-                break_on_unprocessable=False,
-            )
-
-        if not has_images:
-            return text if has_text else None
-
-        cached_captions = _fetch_cached_image_captions(user_file, document_index)
-
-        parts: list[str] = []
-        if has_text:
-            parts.append(text)
-        parts.extend(cached_captions)
-
-        return "\n\n".join(parts).strip() or None
+        return text_content or None
     except Exception:
-        logger.warning(f"Failed to extract text from file {f.file_id}", exc_info=True)
+        logger.warning("Failed to extract text from file %s", f.file_id, exc_info=True)
         return None
 
 
@@ -506,23 +423,6 @@ def extract_context_files(
         db_session=db_session,
     )
 
-    # The document index is used at chat time to read cached image captions
-    # (produced during indexing) so vision-LLM calls don't re-run per turn.
-    document_index: DocumentIndex | None = None
-    if not DISABLE_VECTOR_DB and get_image_extraction_and_analysis_enabled():
-        try:
-            active_search_settings = get_active_search_settings(db_session)
-            document_index = get_default_document_index(
-                search_settings=active_search_settings.primary,
-                secondary_search_settings=None,
-                db_session=db_session,
-            )
-        except Exception:
-            logger.warning(
-                "Failed to construct document index for caption lookup",
-                exc_info=True,
-            )
-
     file_texts: list[str] = []
     image_files: list[ChatLoadedFile] = []
     file_metadata: list[ContextFileMetadata] = []
@@ -538,18 +438,17 @@ def extract_context_files(
             # Only the metadata is provided, with LLM using tools
             if not uf:
                 logger.error(
-                    f"File with id={f.file_id} in metadata-only path with no associated user file"
+                    "File with id=%s in metadata-only path with no associated user file",
+                    f.file_id,
                 )
                 continue
             tool_metadata.append(_build_tool_metadata(uf))
         elif f.file_type.is_text_file():
-            text_content = _extract_text_from_in_memory_file(
-                f, user_file=uf, document_index=document_index
-            )
+            text_content = _extract_text_from_in_memory_file(f)
             if not text_content:
                 continue
             if not uf:
-                logger.warning(f"No user file for file_id={f.file_id}")
+                logger.warning("No user file for file_id=%s", f.file_id)
                 continue
             file_texts.append(text_content)
             file_metadata.append(
@@ -984,6 +883,12 @@ def build_chat_turn(
     files = load_all_chat_files(chat_history, db_session)
     # Convert loaded files to ChatFile format for tools like PythonTool
     chat_files_for_tools = _convert_loaded_files_to_chat_files(files)
+    chat_files_for_tools.extend(
+        _load_context_user_files_for_tools(
+            context_user_files,
+            {chat_file.filename for chat_file in chat_files_for_tools},
+        )
+    )
 
     # ── Reserve assistant message ID(s) → yield to frontend ──────────────────
     if is_multi:
@@ -1049,7 +954,8 @@ def build_chat_turn(
 
     if all_injected_file_metadata:
         logger.debug(
-            f"FileReader: file metadata for LLM: {[(fid, m.filename) for fid, m in all_injected_file_metadata.items()]}"
+            "FileReader: file metadata for LLM: %s",
+            [(fid, m.filename) for fid, m in all_injected_file_metadata.items()],
         )
 
     if summary_message is not None:
@@ -1116,6 +1022,15 @@ def build_chat_turn(
 # Sentinel placed on the merged queue when a model thread finishes.
 _MODEL_DONE = object()
 
+
+# Which exit path persisted a model's outcome — for log attribution.
+class _PersistContext(Enum):
+    WORKER = "worker"
+    STOP_BUTTON = "stop-button"
+    NORMAL = "normal"
+    POST_STEPS = "post-steps"
+
+
 # How often the drain loop polls for user-initiated cancellation (stop button).
 _CANCEL_POLL_INTERVAL_S: Final[float] = 0.05
 
@@ -1123,15 +1038,17 @@ _CANCEL_POLL_INTERVAL_S: Final[float] = 0.05
 def _run_models(
     setup: ChatTurnSetup,
     user: User,
-    db_session: Session,
     external_state_container: ChatStateContainer | None = None,
 ) -> AnswerStream:
     """Stream packets from one or more LLM loops running in parallel worker threads.
 
-    Each model gets its own worker thread, DB session, and ``Emitter``. Threads write
-    packets to a shared unbounded queue as they are produced; the drain loop yields them
-    in arrival order so the caller receives a single interleaved stream regardless of
-    how many models are running.
+    Each model gets its own worker thread, ``Emitter``, and short-lived DB sessions
+    opened on demand. Threads write packets to a shared unbounded queue as they are
+    produced; the drain loop yields them in arrival order so the caller receives a
+    single interleaved stream regardless of how many models are running.
+
+    No DB connection is held across the LLM stream — completion + error handlers
+    open their own short sessions when persistence is needed.
 
     Single-model (N=1) and multi-model (N>1) use the same execution path. Every
     packet is tagged with ``model_index`` by the model's Emitter — ``0`` for N=1,
@@ -1140,8 +1057,6 @@ def _run_models(
     Args:
         setup: Fully constructed turn context — LLMs, persona, history, tool config.
         user: Authenticated user making the request.
-        db_session: Caller's DB session (used for setup reads; each worker opens its own
-            session because SQLAlchemy sessions are not thread-safe).
         external_state_container: Pre-constructed state container for the first model.
             Used by evals and the non-streaming API path so the caller can inspect
             accumulated state (tool calls, answer tokens, citations) after the stream
@@ -1169,10 +1084,88 @@ def _run_models(
     # Set to True when a model raises an exception (distinct from "still running").
     # Used in the stop-button path to avoid calling completion for errored models.
     model_errored: list[bool] = [False] * n_models
+    # Per-model classified (message, error_code, is_retryable), set in _run_model
+    # and reused by the streamed packet and the persisted message.
+    model_error_info: list[tuple[str, str, bool] | None] = [None] * n_models
+    persist_lock = threading.Lock()
+    persisted: list[bool] = [False] * n_models
+    finished_count: list[int] = [0]
+    post_steps_done = threading.Event()
 
     # Set when the drain loop exits early (HTTP disconnect / GeneratorExit).
     # Signals emitters to skip future puts so workers exit promptly.
     drain_done = threading.Event()
+
+    def _persist_model_outcome(
+        model_idx: int,
+        context: _PersistContext,
+        *,
+        stop_button: bool = False,
+    ) -> None:
+        """Persist one model's outcome exactly once, from any thread.
+
+        The LLM loops never observe the stop signal, so a worker that returns
+        non-errored always holds a complete answer. Partial content exists only
+        when the stop-button path snapshots a still-running model mid-loop —
+        that call forces a claim (``stop_button=True``) so the in-flight state
+        is saved with the stopped-by-user annotation and the worker's later
+        call becomes a no-op."""
+        with persist_lock:
+            if persisted[model_idx]:
+                return
+            succeeded = model_succeeded[model_idx]
+            errored = model_errored[model_idx]
+            if not succeeded and not errored and not stop_button:
+                return
+            persisted[model_idx] = True
+
+        if errored:
+            _save_errored_message(model_idx, context)
+            return
+
+        completed_normally = succeeded if stop_button else True
+
+        def _is_connected(value: bool = completed_normally) -> bool:
+            return value
+
+        try:
+            llm_loop_completion_handle(
+                state_container=state_containers[model_idx],
+                is_connected=_is_connected,
+                assistant_message=setup.reserved_messages[model_idx],
+                llm=setup.llms[model_idx],
+                reserved_tokens=setup.reserved_token_count,
+            )
+        except Exception:
+            logger.exception(
+                "%s completion failed for model %d (%s)",
+                context.value,
+                model_idx,
+                setup.model_display_names[model_idx],
+            )
+
+    def _run_post_steps() -> None:
+        with persist_lock:
+            if post_steps_done.is_set():
+                return
+            post_steps_done.set()
+
+        for i in range(n_models):
+            _persist_model_outcome(i, _PersistContext.POST_STEPS)
+
+        # _stream_chat_turn's own reset can be abandoned on disconnect; reset here
+        # so the session never sticks at "processing". Normal exits (drain alive)
+        # leave it to _stream_chat_turn.
+        if not drain_done.is_set():
+            return
+        try:
+            set_processing_status(
+                chat_session_id=setup.chat_session.id,
+                cache=setup.cache,
+                value=False,
+            )
+        except Exception:
+            logger.exception("post-steps processing status reset failed")
 
     def _run_model(model_idx: int) -> None:
         """Run one LLM loop inside a worker thread, writing packets to ``merged_queue``."""
@@ -1271,24 +1264,61 @@ def _run_models(
 
         except Exception as e:
             model_errored[model_idx] = True
+            message, error_code, is_retryable = litellm_exception_to_error_msg(
+                e, model_llm, fallback_to_error_msg=True
+            )
+            # Redact here so both the streamed and persisted error are safe:
+            # the fallback path returns str(e) verbatim, which can embed the key.
+            if model_llm.config.api_key and len(model_llm.config.api_key) > 2:
+                message = message.replace(
+                    model_llm.config.api_key, "[REDACTED_API_KEY]"
+                )
+            model_error_info[model_idx] = (message, error_code, is_retryable)
             merged_queue.put((model_idx, e))
 
         finally:
+            _persist_model_outcome(model_idx, _PersistContext.WORKER)
+
+            is_last = False
+            with persist_lock:
+                finished_count[0] += 1
+                is_last = finished_count[0] == n_models and drain_done.is_set()
+
+            if is_last:
+                _run_post_steps()
+                while True:
+                    try:
+                        merged_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
             merged_queue.put((model_idx, _MODEL_DONE))
 
-    def _save_errored_message(model_idx: int, context: str) -> None:
+    def _save_errored_message(model_idx: int, context: _PersistContext) -> None:
         """Save an error message to a reserved ChatMessage that failed during execution."""
         try:
-            msg = db_session.get(ChatMessage, setup.reserved_messages[model_idx].id)
-            if msg is not None:
-                error_text = f"Error from {setup.model_display_names[model_idx]}: model encountered an error during generation."
-                msg.message = error_text
-                msg.error = error_text
-                db_session.commit()
+            with get_session_with_current_tenant() as save_db_session:
+                msg = save_db_session.get(
+                    ChatMessage, setup.reserved_messages[model_idx].id
+                )
+                if msg is not None:
+                    info = model_error_info[model_idx]
+                    detail = (
+                        info[0]
+                        if info is not None
+                        else "model encountered an error during generation."
+                    )
+                    error_text = "Error from %s: %s" % (
+                        setup.model_display_names[model_idx],
+                        detail,
+                    )
+                    msg.message = error_text
+                    msg.error = error_text
+                    save_db_session.commit()
         except Exception:
             logger.exception(
                 "%s error save failed for model %d (%s)",
-                context,
+                context.value,
                 model_idx,
                 setup.model_display_names[model_idx],
             )
@@ -1306,56 +1336,57 @@ def _run_models(
 
         # ── Main thread: merge and yield packets ────────────────────────────
         models_remaining = n_models
+        last_packet_yield: float = time.monotonic()
         while models_remaining > 0:
             try:
                 model_idx, item = merged_queue.get(timeout=_CANCEL_POLL_INTERVAL_S)
             except queue.Empty:
                 # Check for user-initiated cancellation every 50 ms.
                 if not setup.check_is_connected():
-                    # Save state for every model before exiting.
-                    # - Succeeded models: full answer (is_connected=True).
-                    # - Still-in-flight models: partial answer + "stopped by user".
-                    # - Errored models: delete the orphaned reserved message; do NOT
-                    #   save "stopped by user" for a model that actually threw an exception.
+                    # Persist finished models now; workers persist themselves on exit.
                     for i in range(n_models):
-                        if model_errored[i]:
-                            _save_errored_message(i, "stop-button")
-                            continue
-                        try:
-                            succeeded = model_succeeded[i]
-                            llm_loop_completion_handle(
-                                state_container=state_containers[i],
-                                is_connected=lambda: succeeded,
-                                db_session=db_session,
-                                assistant_message=setup.reserved_messages[i],
-                                llm=setup.llms[i],
-                                reserved_tokens=setup.reserved_token_count,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "stop-button completion failed for model %d (%s)",
-                                i,
-                                setup.model_display_names[i],
-                            )
+                        # Snapshot every model now: finished loops save complete,
+                        # in-flight ones save partial + stopped-by-user.
+                        _persist_model_outcome(
+                            i, _PersistContext.STOP_BUTTON, stop_button=True
+                        )
                     yield Packet(
                         placement=Placement(turn_index=0),
                         obj=OverallStop(type="stop", stop_reason="user_cancelled"),
                     )
+                    drain_done.set()
                     completion_persisted = True
                     return
+                now = time.monotonic()
+                if now - last_packet_yield >= CHAT_HEARTBEAT_INTERVAL_S:
+                    yield Packet(
+                        placement=Placement(turn_index=0),
+                        obj=ChatHeartbeat(),
+                    )
+                    last_packet_yield = now
                 continue
             else:
                 if item is _MODEL_DONE:
                     models_remaining -= 1
                 elif isinstance(item, Exception):
-                    # Yield a tagged error for this model but keep the other models running.
-                    # Do NOT decrement models_remaining — _run_model's finally always posts
-                    # _MODEL_DONE, which is the sole completion signal.
-                    error_msg = str(item)
+                    # Yield a tagged error for this model but keep the other
+                    # models running. Do NOT decrement models_remaining —
+                    # _run_model's finally always posts _MODEL_DONE, which is
+                    # the sole completion signal.
+                    model_llm = setup.llms[model_idx]
+                    # Classified in _run_model; fall back to a generic error.
+                    info = model_error_info[model_idx]
+                    if info is not None:
+                        error_msg, err_code, err_retryable = info
+                    else:
+                        error_msg, err_code, err_retryable = (
+                            str(item),
+                            "MODEL_ERROR",
+                            True,
+                        )
                     stack_trace = "".join(
                         traceback.format_exception(type(item), item, item.__traceback__)
                     )
-                    model_llm = setup.llms[model_idx]
                     if model_llm.config.api_key and len(model_llm.config.api_key) > 2:
                         error_msg = error_msg.replace(
                             model_llm.config.api_key, "[REDACTED_API_KEY]"
@@ -1366,42 +1397,23 @@ def _run_models(
                     yield StreamingError(
                         error=error_msg,
                         stack_trace=stack_trace,
-                        error_code="MODEL_ERROR",
-                        is_retryable=True,
+                        error_code=err_code,
+                        is_retryable=err_retryable,
                         details={
                             "model": model_llm.config.model_name,
                             "provider": model_llm.config.model_provider,
                             "model_index": model_idx,
                         },
                     )
+                    last_packet_yield = time.monotonic()
                 elif isinstance(item, Packet):
                     # model_index already embedded by the model's Emitter in _run_model
                     yield item
+                    last_packet_yield = time.monotonic()
 
-        # ── Completion: save each successful model's response ───────────────
-        # All model loops have completed (run_llm_loop returned) — no more writes
-        # to state_containers. Worker threads may still be closing their own DB
-        # sessions, but the main-thread db_session is unshared and safe to use.
         for i in range(n_models):
-            if not model_succeeded[i]:
-                # Model errored — delete its orphaned reserved message.
-                _save_errored_message(i, "normal")
-                continue
-            try:
-                llm_loop_completion_handle(
-                    state_container=state_containers[i],
-                    is_connected=setup.check_is_connected,
-                    db_session=db_session,
-                    assistant_message=setup.reserved_messages[i],
-                    llm=setup.llms[i],
-                    reserved_tokens=setup.reserved_token_count,
-                )
-            except Exception:
-                logger.exception(
-                    "normal completion failed for model %d (%s)",
-                    i,
-                    setup.model_display_names[i],
-                )
+            _persist_model_outcome(i, _PersistContext.NORMAL)
+        _run_post_steps()
         completion_persisted = True
 
     finally:
@@ -1410,47 +1422,24 @@ def _run_models(
             # Threads are done (normal path) or can finish in the background (stop-button).
             executor.shutdown(wait=False)
         else:
-            # Early exit (GeneratorExit from raw HTTP disconnect, or unhandled
-            # exception in the drain loop).
-            # 1. Signal emitters to stop — future emit() calls return immediately,
-            #    so workers exit their LLM loops promptly.
             drain_done.set()
-            # 2. Wait for all workers to finish. Once drain_done is set the Emitter
-            #    short-circuits, so workers should exit quickly.
-            executor.shutdown(wait=True)
-            # 3. All workers are done — complete from the main thread only.
-            for i in range(n_models):
-                if model_succeeded[i]:
-                    try:
-                        llm_loop_completion_handle(
-                            state_container=state_containers[i],
-                            # Model already finished — persist full response.
-                            is_connected=lambda: True,
-                            db_session=db_session,
-                            assistant_message=setup.reserved_messages[i],
-                            llm=setup.llms[i],
-                            reserved_tokens=setup.reserved_token_count,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "disconnect completion failed for model %d (%s)",
-                            i,
-                            setup.model_display_names[i],
-                        )
-                elif model_errored[i]:
-                    _save_errored_message(i, "disconnect")
-            # 4. Drain buffered packets from memory — no consumer is running.
-            while not merged_queue.empty():
-                try:
-                    merged_queue.get_nowait()
-                except queue.Empty:
-                    break
+            executor.shutdown(wait=False)
+            with persist_lock:
+                all_finished: bool = finished_count[0] == n_models
+                running_count: int = n_models - finished_count[0]
+            # No worker runs post-steps if they all finished before drain_done was set.
+            if all_finished:
+                _run_post_steps()
+            else:
+                logger.info(
+                    "client disconnected; %d model(s) still running will persist on completion",
+                    running_count,
+                )
 
 
 def _stream_chat_turn(
     new_msg_req: SendMessageRequest,
     user: User,
-    db_session: Session,
     llm_overrides: list[LLMOverride] | None = None,
     litellm_additional_headers: dict[str, str] | None = None,
     custom_tool_additional_headers: dict[str, str] | None = None,
@@ -1462,10 +1451,11 @@ def _stream_chat_turn(
 ) -> AnswerStream:
     """Private implementation for single-model and multi-model chat turn streaming.
 
-    Builds the turn context via ``build_chat_turn``, then streams packets from
-    ``_run_models`` back to the caller. Handles setup errors, LLM errors, and
-    cancellation uniformly, saving whatever partial state has been accumulated
-    before re-raising or yielding a terminal error packet.
+    Builds the turn context via ``build_chat_turn`` inside a short-lived DB session,
+    then streams packets from ``_run_models`` back to the caller without holding any
+    DB connection. Handles setup errors, LLM errors, and cancellation uniformly,
+    saving whatever partial state has been accumulated before re-raising or yielding
+    a terminal error packet.
 
     Not called directly — use the public wrappers:
     - ``handle_stream_message_objects`` for single-model (N=1) requests.
@@ -1474,7 +1464,6 @@ def _stream_chat_turn(
     Args:
         new_msg_req: The incoming chat request from the user.
         user: Authenticated user; may be anonymous for public personas.
-        db_session: Database session for this request.
         llm_overrides: ``None`` → single-model (persona default LLM).
             Non-empty list → multi-model (one LLM per override, 2–3 items).
         litellm_additional_headers: Extra headers forwarded to the LLM provider.
@@ -1501,53 +1490,61 @@ def _stream_chat_turn(
     setup: ChatTurnSetup | None = None
 
     try:
-        # Enforce document-set access on any user-supplied filters before setup
-        # or any tool invocation. Running here (rather than inside SearchTool.run())
-        # means the OnyxError propagates to the StreamingError handler below
-        # instead of being swallowed by the tool runner's catch-all.
-        if (
-            not bypass_acl
-            and new_msg_req.internal_search_filters is not None
-            and new_msg_req.internal_search_filters.document_set is not None
-        ):
-            accessible_names = filter_document_set_names_by_user_access(
-                db_session=db_session,
-                document_set_names=new_msg_req.internal_search_filters.document_set,
-                user=user,
-            )
-            unauthorized = sorted(
-                name
-                for name in new_msg_req.internal_search_filters.document_set
-                if name not in accessible_names
-            )
-            if unauthorized:
-                raise OnyxError(
-                    OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
-                    f"User does not have access to document sets: {unauthorized}",
+        with get_session_with_current_tenant() as setup_db_session:
+            try:
+                if (
+                    not bypass_acl
+                    and not user.is_anonymous
+                    and new_msg_req.internal_search_filters is not None
+                    and new_msg_req.internal_search_filters.document_set is not None
+                ):
+                    # TODO @wenxi-onyx: this check for doc set access has been added
+                    # to SearchTool.run() so that all invocations of the SearchTool
+                    # will check for access before running. This instance should be removed
+                    # in a follow up PR.
+                    accessible_names = filter_document_set_names_by_user_access(
+                        db_session=setup_db_session,
+                        document_set_names=new_msg_req.internal_search_filters.document_set,
+                        user=user,
+                    )
+                    unauthorized = sorted(
+                        name
+                        for name in new_msg_req.internal_search_filters.document_set
+                        if name not in accessible_names
+                    )
+                    if unauthorized:
+                        raise OnyxError(
+                            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+                            "User does not have access to document sets: %s"
+                            % unauthorized,
+                        )
+
+                setup = yield from build_chat_turn(
+                    new_msg_req=new_msg_req,
+                    user=user,
+                    db_session=setup_db_session,
+                    llm_overrides=llm_overrides,
+                    litellm_additional_headers=litellm_additional_headers,
+                    custom_tool_additional_headers=custom_tool_additional_headers,
+                    mcp_headers=mcp_headers,
+                    bypass_acl=bypass_acl,
+                    slack_context=slack_context,
+                    additional_context=additional_context,
                 )
+                setup_db_session.expunge_all()
+            except Exception:
+                setup_db_session.rollback()
+                raise
 
-        setup = yield from build_chat_turn(
-            new_msg_req=new_msg_req,
-            user=user,
-            db_session=db_session,
-            llm_overrides=llm_overrides,
-            litellm_additional_headers=litellm_additional_headers,
-            custom_tool_additional_headers=custom_tool_additional_headers,
-            mcp_headers=mcp_headers,
-            bypass_acl=bypass_acl,
-            slack_context=slack_context,
-            additional_context=additional_context,
-        )
-
-        # Set mock response token right before the LLM stream begins so that
-        # run_in_background threads inherit the correct context.
         if new_msg_req.mock_llm_response is not None:
             mock_response_token = set_llm_mock_response(new_msg_req.mock_llm_response)
 
+        assert setup is not None, (
+            "build_chat_turn must complete before _run_models is called"
+        )
         yield from _run_models(
             setup=setup,
             user=user,
-            db_session=db_session,
             external_state_container=external_state_container,
         )
 
@@ -1559,7 +1556,6 @@ def _stream_chat_turn(
             error_code=e.error_code.code,
             is_retryable=e.status_code >= 500,
         )
-        db_session.rollback()
         return
 
     except ValueError as e:
@@ -1569,13 +1565,15 @@ def _stream_chat_turn(
             error_code="VALIDATION_ERROR",
             is_retryable=True,
         )
-        db_session.rollback()
         return
 
     except EmptyLLMResponseError as e:
         stack_trace = traceback.format_exc()
         logger.warning(
-            f"LLM returned an empty response (provider={e.provider}, model={e.model}, tool_choice={e.tool_choice})"
+            "LLM returned an empty response (provider=%s, model=%s, tool_choice=%s)",
+            e.provider,
+            e.model,
+            e.tool_choice,
         )
         yield StreamingError(
             error=e.client_error_msg,
@@ -1588,10 +1586,9 @@ def _stream_chat_turn(
                 "tool_choice": e.tool_choice.value,
             },
         )
-        db_session.rollback()
 
     except Exception as e:
-        logger.exception(f"Failed to process chat message due to {e}")
+        logger.exception("Failed to process chat message due to %s", e)
         stack_trace = traceback.format_exc()
 
         llm = setup.llms[0] if setup else None
@@ -1623,7 +1620,6 @@ def _stream_chat_turn(
                 error_code="INIT_FAILED",
                 is_retryable=True,
             )
-        db_session.rollback()
 
     finally:
         if mock_response_token is not None:
@@ -1642,7 +1638,6 @@ def _stream_chat_turn(
 def handle_stream_message_objects(
     new_msg_req: SendMessageRequest,
     user: User,
-    db_session: Session,
     litellm_additional_headers: dict[str, str] | None = None,
     custom_tool_additional_headers: dict[str, str] | None = None,
     mcp_headers: dict[str, str] | None = None,
@@ -1655,7 +1650,6 @@ def handle_stream_message_objects(
     yield from _stream_chat_turn(
         new_msg_req=new_msg_req,
         user=user,
-        db_session=db_session,
         llm_overrides=None,
         litellm_additional_headers=litellm_additional_headers,
         custom_tool_additional_headers=custom_tool_additional_headers,
@@ -1684,7 +1678,6 @@ def _build_model_display_name(override: LLMOverride | None, llm: LLM) -> str:
 def handle_multi_model_stream(
     new_msg_req: SendMessageRequest,
     user: User,
-    db_session: Session,
     llm_overrides: list[LLMOverride],
     litellm_additional_headers: dict[str, str] | None = None,
     custom_tool_additional_headers: dict[str, str] | None = None,
@@ -1698,7 +1691,6 @@ def handle_multi_model_stream(
     Args:
         new_msg_req: The incoming chat request. ``deep_research`` must be ``False``.
         user: Authenticated user making the request.
-        db_session: Database session for this request.
         llm_overrides: Exactly 2 or 3 ``LLMOverride`` objects — one per model to run.
         litellm_additional_headers: Extra headers forwarded to each LLM provider.
         custom_tool_additional_headers: Extra headers for custom tool HTTP calls.
@@ -1711,7 +1703,7 @@ def handle_multi_model_stream(
     n_models = len(llm_overrides)
     if n_models < 2 or n_models > 3:
         yield StreamingError(
-            error=f"Multi-model requires 2-3 overrides, got {n_models}",
+            error="Multi-model requires 2-3 overrides, got %d" % n_models,
             error_code="VALIDATION_ERROR",
             is_retryable=False,
         )
@@ -1726,7 +1718,6 @@ def handle_multi_model_stream(
     yield from _stream_chat_turn(
         new_msg_req=new_msg_req,
         user=user,
-        db_session=db_session,
         llm_overrides=llm_overrides,
         litellm_additional_headers=litellm_additional_headers,
         custom_tool_additional_headers=custom_tool_additional_headers,
@@ -1737,13 +1728,10 @@ def handle_multi_model_stream(
 def llm_loop_completion_handle(
     state_container: ChatStateContainer,
     is_connected: Callable[[], bool],
-    db_session: Session,
     assistant_message: ChatMessage,
     llm: LLM,
     reserved_tokens: int,
 ) -> None:
-    chat_session_id = assistant_message.chat_session_id
-
     # Snapshot all state under the container's lock before any DB write.
     # Worker threads may still be running (e.g. user-cancellation path), so
     # direct attribute access is not thread-safe — use the provided getters.
@@ -1757,6 +1745,8 @@ def llm_loop_completion_handle(
     pre_answer_processing_time = state_container.get_pre_answer_processing_time()
 
     completed_normally = is_connected()
+    chat_session_id: UUID = assistant_message.chat_session_id
+    assistant_message_id: int = assistant_message.id
     if completed_normally:
         if answer_tokens is None:
             raise RuntimeError(
@@ -1764,8 +1754,7 @@ def llm_loop_completion_handle(
             )
         final_answer = answer_tokens
     else:
-        # Stopped by user - append stop message
-        logger.debug(f"Chat session {chat_session_id} stopped by user")
+        logger.debug("Chat session %s stopped by user", chat_session_id)
         if answer_tokens:
             final_answer = (
                 answer_tokens + " ... \n\nGeneration was stopped by the user."
@@ -1773,25 +1762,36 @@ def llm_loop_completion_handle(
         else:
             final_answer = "The generation was stopped by the user."
 
-    save_chat_turn(
-        message_text=final_answer,
-        reasoning_tokens=reasoning_tokens,
-        citation_to_doc=citation_to_doc,
-        tool_calls=tool_calls,
-        all_search_docs=all_search_docs,
-        db_session=db_session,
-        assistant_message=assistant_message,
-        is_clarification=is_clarification,
-        emitted_citations=emitted_citations,
-        pre_answer_processing_time=pre_answer_processing_time,
-    )
+    # Open a short-lived session here rather than holding one across the LLM
+    # stream. Re-fetch the ChatMessage so save_chat_turn's mutations are applied
+    # on top of current DB state — using merge() would silently overwrite any
+    # concurrent writes (admin edits, retries) made between build_chat_turn's
+    # commit and this completion handler.
+    with get_session_with_current_tenant() as db_session:
+        attached_message = db_session.get(ChatMessage, assistant_message_id)
+        if attached_message is None:
+            raise RuntimeError(
+                "ChatMessage %d not found during completion" % assistant_message_id
+            )
 
-    # Check if compression is needed after saving the message
-    updated_chat_history = create_chat_history_chain(
-        chat_session_id=chat_session_id,
-        db_session=db_session,
-    )
-    total_tokens = calculate_total_history_tokens(updated_chat_history)
+        save_chat_turn(
+            message_text=final_answer,
+            reasoning_tokens=reasoning_tokens,
+            citation_to_doc=citation_to_doc,
+            tool_calls=tool_calls,
+            all_search_docs=all_search_docs,
+            db_session=db_session,
+            assistant_message=attached_message,
+            is_clarification=is_clarification,
+            emitted_citations=emitted_citations,
+            pre_answer_processing_time=pre_answer_processing_time,
+        )
+
+        updated_chat_history = create_chat_history_chain(
+            chat_session_id=chat_session_id,
+            db_session=db_session,
+        )
+        total_tokens = calculate_total_history_tokens(updated_chat_history)
 
     compression_params = get_compression_params(
         max_input_tokens=llm.config.max_input_tokens,
@@ -1799,16 +1799,10 @@ def llm_loop_completion_handle(
         reserved_tokens=reserved_tokens,
     )
     if compression_params.should_compress:
-        # Build tool mapping for formatting messages
-        all_tools = get_tools(db_session)
-        tool_id_to_name = {tool.id: tool.name for tool in all_tools}
-
         compress_chat_history(
-            db_session=db_session,
             chat_history=updated_chat_history,
             llm=llm,
             compression_params=compression_params,
-            tool_id_to_name=tool_id_to_name,
         )
 
 

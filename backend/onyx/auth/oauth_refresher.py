@@ -17,9 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from onyx.configs.app_configs import OAUTH_CLIENT_ID
 from onyx.configs.app_configs import OAUTH_CLIENT_SECRET
 from onyx.configs.app_configs import OPENID_CONFIG_URL
-from onyx.configs.app_configs import TRACK_EXTERNAL_IDP_EXPIRY
 from onyx.db.models import OAuthAccount
 from onyx.db.models import User
+from onyx.server.security.store import get_security_settings
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -179,7 +179,7 @@ async def _test_expire_oauth_token(
 
         return True
     except Exception as e:
-        logger.exception(f"Error setting artificial expiration: {str(e)}")
+        logger.exception("Error setting artificial expiration: %s", str(e))
         return False
 
 
@@ -195,7 +195,9 @@ async def refresh_oauth_token(
     """
     if not oauth_account.refresh_token:
         logger.warning(
-            f"No refresh token available for {user.email}'s {oauth_account.oauth_name} account"
+            "No refresh token available for %s's %s account",
+            user.email,
+            oauth_account.oauth_name,
         )
         return False
 
@@ -206,7 +208,7 @@ async def refresh_oauth_token(
         return False
 
     try:
-        logger.info(f"Refreshing OAuth token for {user.email}'s {provider} account")
+        logger.info("Refreshing OAuth token for %s's %s account", user.email, provider)
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -222,7 +224,7 @@ async def refresh_oauth_token(
 
             if response.status_code != 200:
                 logger.error(
-                    f"Failed to refresh OAuth token: Status {response.status_code}"
+                    "Failed to refresh OAuth token: Status %s", response.status_code
                 )
                 return False
 
@@ -250,8 +252,7 @@ async def refresh_oauth_token(
             if new_expires_at:
                 updated_data["expires_at"] = new_expires_at
 
-                # Update oidc_expiry in user model if we're tracking it
-                if TRACK_EXTERNAL_IDP_EXPIRY:
+                if get_security_settings().track_external_idp_expiry:
                     oidc_expiry = datetime.fromtimestamp(
                         new_expires_at, tz=timezone.utc
                     )
@@ -266,11 +267,11 @@ async def refresh_oauth_token(
                 updated_data,
             )
 
-            logger.info(f"Successfully refreshed OAuth token for {user.email}")
+            logger.info("Successfully refreshed OAuth token for %s", user.email)
             return True
 
     except Exception as e:
-        logger.exception(f"Error refreshing OAuth token: {str(e)}")
+        logger.exception("Error refreshing OAuth token: %s", str(e))
         return False
 
 

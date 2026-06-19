@@ -188,10 +188,12 @@ async def claim_license(
         try:
             update_license_cache(payload, source=LicenseSource.AUTO_FETCH)
         except Exception as cache_error:
-            logger.warning(f"Failed to update license cache: {cache_error}")
+            logger.warning("Failed to update license cache: %s", cache_error)
 
         logger.info(
-            f"License claimed: seats={payload.seats}, expires={payload.expires_at.date()}"
+            "License claimed: seats=%s, expires=%s",
+            payload.seats,
+            payload.expires_at.date(),
         )
         return LicenseResponse(success=True, license=payload)
 
@@ -255,7 +257,7 @@ async def upload_license(
     try:
         update_license_cache(payload, source=LicenseSource.MANUAL_UPLOAD)
     except Exception as cache_error:
-        logger.warning(f"Failed to update license cache: {cache_error}")
+        logger.warning("Failed to update license cache: %s", cache_error)
 
     return LicenseUploadResponse(
         success=True,
@@ -312,7 +314,7 @@ async def delete_license(
     try:
         invalidate_license_cache()
     except Exception as cache_error:
-        logger.warning(f"Failed to invalidate license cache: {cache_error}")
+        logger.warning("Failed to invalidate license cache: %s", cache_error)
 
     deleted = db_delete_license(db_session)
 

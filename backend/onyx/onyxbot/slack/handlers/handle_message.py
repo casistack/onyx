@@ -67,7 +67,7 @@ def schedule_feedback_reminder(
             message_ts=details.msg_to_respond,  # ty: ignore[invalid-argument-type]
         )
     except SlackApiError as e:
-        logger.error(f"Unable to generate the feedback reminder permalink: {e}")
+        logger.error("Unable to generate the feedback reminder permalink: %s", e)
         return None
 
     now = datetime.datetime.now()
@@ -92,7 +92,7 @@ def schedule_feedback_reminder(
             "scheduled_message_id"
         ]
     except SlackApiError as e:
-        logger.error(f"Unable to generate the feedback reminder message: {e}")
+        logger.error("Unable to generate the feedback reminder message: %s", e)
         return None
 
 
@@ -226,9 +226,9 @@ def handle_message(
                 return False
 
         logger.info(
-            "Found slack bot config for channel. Restricting bot to use document "
-            f"sets: {document_set_names}, "
-            f"validity checks enabled: {channel_conf.get('answer_filters', 'NA')}"
+            "Found slack bot config for channel. Restricting bot to use document sets: %s, validity checks enabled: %s",
+            document_set_names,
+            channel_conf.get("answer_filters", "NA"),
         )
 
         respond_tag_only = channel_conf.get("respond_tag_only") or False
@@ -262,7 +262,7 @@ def handle_message(
     try:
         send_msg_ack_to_user(message_info, client)
     except SlackApiError as e:
-        logger.error(f"Was not able to react to user message due to: {e}")
+        logger.error("Was not able to react to user message due to: %s", e)
 
     with get_session_with_current_tenant() as db_session:
         if message_info.email:
@@ -278,7 +278,9 @@ def handle_message(
                 seat_result = check_seat_fn(db_session=db_session)
                 if seat_result is not None and not seat_result.available:
                     logger.info(
-                        f"Blocked new Slack user {message_info.email}: {seat_result.error_message}"
+                        "Blocked new Slack user %s: %s",
+                        message_info.email,
+                        seat_result.error_message,
                     )
                     respond_in_thread_or_channel(
                         client=client,
@@ -313,7 +315,9 @@ def handle_message(
                 seat_result = check_seat_fn(db_session=db_session)
                 if seat_result is not None and not seat_result.available:
                     logger.info(
-                        f"Blocked inactive Slack user {message_info.email}: {seat_result.error_message}"
+                        "Blocked inactive Slack user %s: %s",
+                        message_info.email,
+                        seat_result.error_message,
                     )
                     respond_in_thread_or_channel(
                         client=client,
@@ -336,7 +340,7 @@ def handle_message(
                     None,
                 )
                 invalidate_license_cache_fn()
-                logger.info(f"Reactivated inactive Slack user {message_info.email}")
+                logger.info("Reactivated inactive Slack user %s", message_info.email)
 
             elif existing_user.account_type == AccountType.EXT_PERM_USER:
                 # Pre-check so the user gets a Slack-side message; the
