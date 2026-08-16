@@ -132,15 +132,9 @@ services:
   inference_model_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-model-server:${IMAGE_TAG:-mybranch}
     pull_policy: always
-    command: >
-      /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
-        echo 'Skipping service...';
-        exit 0;
-      else
-        exec uvicorn model_server.main:app --host 0.0.0.0 --port 9000;
-      fi"
     restart: unless-stopped
     environment:
+      DISABLE_MODEL_SERVER: ${DISABLE_MODEL_SERVER:-false}
       MIN_THREADS_ML_MODELS: ${MIN_THREADS_ML_MODELS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
@@ -156,19 +150,14 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+      start_period: 600s
 
   indexing_model_server:
     image: ghcr.io/${IMAGE_NAMESPACE:-casistack}/onyx-model-server:${IMAGE_TAG:-mybranch}
     pull_policy: always
-    command: >
-      /bin/sh -c "if [ \"${DISABLE_MODEL_SERVER:-}\" = \"True\" ] || [ \"${DISABLE_MODEL_SERVER:-}\" = \"true\" ]; then
-        echo 'Skipping service...';
-        exit 0;
-      else
-        exec uvicorn model_server.main:app --host 0.0.0.0 --port 9000;
-      fi"
     restart: unless-stopped
     environment:
+      DISABLE_MODEL_SERVER: ${DISABLE_MODEL_SERVER:-false}
       INDEXING_ONLY: "True"
       MIN_THREADS_ML_MODELS: ${MIN_THREADS_ML_MODELS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -186,6 +175,7 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+      start_period: 600s
 
   relational_db:
     image: ${POSTGRES_IMAGE:-postgres:15.2-alpine}
