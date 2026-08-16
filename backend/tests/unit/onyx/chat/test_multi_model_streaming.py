@@ -8,27 +8,32 @@ calls, so we can trigger it with lightweight mocks.
 import threading
 import time
 from collections.abc import Generator
-from typing import Any
-from typing import cast
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from litellm.exceptions import ContextWindowExceededError
 
+from onyx.chat.llm_loop import EmptyLLMResponseError
 from onyx.chat.models import StreamingError
 from onyx.configs.constants import MessageType
 from onyx.db.chat import set_preferred_response
 from onyx.db.models import ChatMessage
+from onyx.llm.interfaces import ToolChoiceOptions
 from onyx.llm.override_models import LLMOverride
 from onyx.server.query_and_chat.models import SendMessageRequest
 from onyx.server.query_and_chat.placement import Placement
-from onyx.server.query_and_chat.streaming_models import ChatHeartbeat
-from onyx.server.query_and_chat.streaming_models import OverallStop
-from onyx.server.query_and_chat.streaming_models import Packet
-from onyx.server.query_and_chat.streaming_models import ReasoningStart
+from onyx.server.query_and_chat.streaming_models import (
+    ChatHeartbeat,
+    OverallStop,
+    Packet,
+    ReasoningStart,
+)
 from onyx.utils.variable_functionality import global_version
+
+MODEL_REFUSAL_ERROR_CODE = "MODEL_REFUSAL"
+CONTENT_FILTER_FINISH_REASON = "content_filter"
 
 
 @pytest.fixture(autouse=True)
@@ -250,6 +255,9 @@ def _make_setup(n_models: int = 1) -> MagicMock:
     """Minimal ChatTurnSetup mock whose fields pass Pydantic validation in _run_model."""
     setup = MagicMock()
     setup.llms = [MagicMock() for _ in range(n_models)]
+    # Real int so the min() over model windows in _persist_model_outcome works.
+    for mock_llm in setup.llms:
+        mock_llm.config.max_input_tokens = 32_000
     setup.model_display_names = [f"model-{i}" for i in range(n_models)]
     setup.check_is_connected = MagicMock(return_value=True)
     setup.reserved_messages = [MagicMock() for _ in range(n_models)]
@@ -466,6 +474,38 @@ class TestRunModels:
         assert errors[0].error_code == "CONTEXT_TOO_LONG"
         assert errors[0].is_retryable is False
 
+    def test_model_refusal_preserves_error_classification(self) -> None:
+        refusal_message = "The selected model declined to respond."
+        refusal = EmptyLLMResponseError(
+            provider="anthropic",
+            model="claude-fable-5",
+            tool_choice=ToolChoiceOptions.AUTO,
+            client_error_msg=refusal_message,
+            error_code=MODEL_REFUSAL_ERROR_CODE,
+            is_retryable=False,
+            finish_reason=CONTENT_FILTER_FINISH_REASON,
+        )
+
+        with (
+            patch("onyx.chat.process_message.run_llm_loop", side_effect=refusal),
+            patch("onyx.chat.process_message.run_deep_research_llm_loop"),
+            patch("onyx.chat.process_message.construct_tools", return_value={}),
+            patch("onyx.chat.process_message.llm_loop_completion_handle"),
+            patch(
+                "onyx.chat.process_message.get_llm_token_counter",
+                return_value=lambda _: 0,
+            ),
+        ):
+            packets = _run_models_collect(_make_setup(n_models=1))
+
+        errors = [packet for packet in packets if isinstance(packet, StreamingError)]
+        assert len(errors) == 1
+        assert errors[0].error == refusal_message
+        assert errors[0].error_code == MODEL_REFUSAL_ERROR_CODE
+        assert errors[0].is_retryable is False
+        assert errors[0].details is not None
+        assert errors[0].details["finish_reason"] == CONTENT_FILTER_FINISH_REASON
+
     def test_one_model_error_does_not_stop_other_models(self) -> None:
         """A failing model yields StreamingError; the surviving model's packets still arrive."""
         setup = _make_setup(n_models=2)
@@ -612,6 +652,11 @@ class TestRunModels:
         persisted_llms = [call.kwargs["llm"] for call in mock_handle.call_args_list]
         assert persisted_llms.count(setup.llms[0]) == 1
         assert persisted_llms.count(setup.llms[1]) == 1
+        # Exactly one completion owns compression; the other must skip it.
+        compression_flags = sorted(
+            call.kwargs["run_compression"] for call in mock_handle.call_args_list
+        )
+        assert compression_flags == [False, True]
 
     def test_completion_handle_not_called_for_failed_model(self) -> None:
         """llm_loop_completion_handle must be skipped for a model that raised."""
@@ -635,17 +680,48 @@ class TestRunModels:
 
         mock_handle.assert_not_called()
 
+    def test_compression_falls_to_first_successful_model_when_model_0_errors(
+        self,
+    ) -> None:
+        """Compression ownership goes to the first non-errored completion, not
+        a fixed model index — a model-0 failure must not skip compression."""
+        setup = _make_setup(n_models=2)
+
+        def fail_model_0(**kwargs: Any) -> None:
+            if kwargs["llm"] is setup.llms[0]:
+                raise RuntimeError("fail")
+
+        with (
+            patch("onyx.chat.process_message.run_llm_loop", side_effect=fail_model_0),
+            patch("onyx.chat.process_message.run_deep_research_llm_loop"),
+            patch("onyx.chat.process_message.construct_tools", return_value={}),
+            patch(
+                "onyx.chat.process_message.llm_loop_completion_handle"
+            ) as mock_handle,
+            patch(
+                "onyx.chat.process_message.get_llm_token_counter",
+                return_value=lambda _: 0,
+            ),
+        ):
+            _run_models_collect(setup)
+
+        assert mock_handle.call_count == 1
+        call = mock_handle.call_args_list[0]
+        assert call.kwargs["llm"] is setup.llms[1]
+        assert call.kwargs["run_compression"] is True
+
     def test_http_disconnect_completion_via_generator_exit(self) -> None:
         """Worker-thread completion survives HTTP disconnect."""
 
         completion_called = threading.Event()
+        client_gone = threading.Event()
 
         def emit_then_block_until_drain(**kwargs: Any) -> None:
             emitter = kwargs["emitter"]
             emitter.emit(
                 Packet(placement=Placement(turn_index=0), obj=ReasoningStart())
             )
-            emitter._drain_done.wait(timeout=5)
+            client_gone.wait(timeout=5)
 
         setup = _make_setup(n_models=1)
         setup.check_is_connected = MagicMock(return_value=True)
@@ -672,6 +748,7 @@ class TestRunModels:
             first = next(gen)
             assert isinstance(first, Packet)
             gen.close()
+            client_gone.set()
 
             assert completion_called.wait(timeout=5), (
                 "worker thread must call completion for the successful model"
@@ -681,12 +758,14 @@ class TestRunModels:
     def test_http_disconnect_error_saves_message_once(self) -> None:
         """Disconnecting during an erroring run saves the errored message once."""
 
+        client_gone = threading.Event()
+
         def emit_then_raise_after_drain(**kwargs: Any) -> None:
             emitter = kwargs["emitter"]
             emitter.emit(
                 Packet(placement=Placement(turn_index=0), obj=ReasoningStart())
             )
-            emitter._drain_done.wait(timeout=5)
+            client_gone.wait(timeout=5)
             raise RuntimeError("disconnect failure")
 
         setup = _make_setup(n_models=1)
@@ -724,6 +803,7 @@ class TestRunModels:
             first = next(gen)
             assert isinstance(first, Packet)
             gen.close()
+            client_gone.set()
 
             assert commit_called.wait(timeout=5)
             mock_handle.assert_not_called()
@@ -781,6 +861,8 @@ class TestRunModels:
     def test_http_disconnect_persists_each_model_once(self) -> None:
         """Disconnecting mid-run persists each model once, even with staggered exits."""
 
+        client_gone = threading.Event()
+
         def emit_and_maybe_block(**kwargs: Any) -> None:
             emitter = kwargs["emitter"]
             llm = kwargs["llm"]
@@ -788,7 +870,7 @@ class TestRunModels:
                 Packet(placement=Placement(turn_index=0), obj=ReasoningStart())
             )
             if llm is setup.llms[1]:
-                emitter._drain_done.wait(timeout=5)
+                client_gone.wait(timeout=5)
 
         setup = _make_setup(n_models=2)
         setup.check_is_connected = MagicMock(return_value=True)
@@ -824,12 +906,68 @@ class TestRunModels:
             assert isinstance(first, Packet)
             assert model_0_persisted.wait(timeout=5)
             gen.close()
+            client_gone.set()
             assert model_1_persisted.wait(timeout=5)
 
         assert mock_handle.call_count == 2
         persisted_llms = [call.kwargs["llm"] for call in mock_handle.call_args_list]
         assert persisted_llms.count(setup.llms[0]) == 1
         assert persisted_llms.count(setup.llms[1]) == 1
+
+    def test_disconnect_buffers_full_stream_and_marks_done(self) -> None:
+        """After a disconnect the writer keeps buffering to the end and marks done."""
+
+        client_gone = threading.Event()
+
+        def emit_then_block(**kwargs: Any) -> None:
+            kwargs["emitter"].emit(
+                Packet(placement=Placement(turn_index=0), obj=ReasoningStart())
+            )
+            client_gone.wait(timeout=5)
+            kwargs["emitter"].emit(
+                Packet(placement=Placement(turn_index=0), obj=ReasoningStart())
+            )
+
+        setup = _make_setup(n_models=1)
+        setup.check_is_connected = MagicMock(return_value=True)
+        stream_buffer = MagicMock()
+        done_marked = threading.Event()
+        stream_buffer.mark_done.side_effect = lambda: done_marked.set()
+
+        with (
+            patch(
+                "onyx.chat.process_message.run_llm_loop",
+                side_effect=emit_then_block,
+            ),
+            patch("onyx.chat.process_message.run_deep_research_llm_loop"),
+            patch("onyx.chat.process_message.construct_tools", return_value={}),
+            patch("onyx.chat.process_message.llm_loop_completion_handle"),
+            patch(
+                "onyx.chat.process_message.get_llm_token_counter",
+                return_value=lambda _: 0,
+            ),
+        ):
+            from onyx.chat.process_message import _run_models
+
+            gen = cast(
+                Generator,
+                _run_models(setup, MagicMock(), stream_buffer=stream_buffer),
+            )
+            first = next(gen)
+            assert isinstance(first, Packet)
+            gen.close()
+            client_gone.set()
+
+            assert done_marked.wait(timeout=5), (
+                "writer must mark the buffer done after the run finishes"
+            )
+
+        buffered = "".join(
+            call.args[0] for call in stream_buffer.append_line.call_args_list
+        )
+        # Both packets reached the buffer — including the one emitted after the
+        # client was gone.
+        assert buffered.count("reasoning_start") == 2
 
     def test_stop_button_does_not_call_completion_for_errored_model(self) -> None:
         """Stop-button completion skips errored models."""

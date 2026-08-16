@@ -2,38 +2,44 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import pytest
 from fastapi import Response
 from sqlalchemy.exc import IntegrityError
 
 from ee.onyx.db.license import seat_lock_id_for_tenant
-from ee.onyx.server.scim.api import _check_seat_availability
-from ee.onyx.server.scim.api import _scim_name_to_str
-from ee.onyx.server.scim.api import create_user
-from ee.onyx.server.scim.api import delete_user
-from ee.onyx.server.scim.api import get_user
-from ee.onyx.server.scim.api import list_users
-from ee.onyx.server.scim.api import patch_user
-from ee.onyx.server.scim.api import replace_user
-from ee.onyx.server.scim.models import ScimMappingFields
-from ee.onyx.server.scim.models import ScimName
-from ee.onyx.server.scim.models import ScimPatchOperation
-from ee.onyx.server.scim.models import ScimPatchOperationType
-from ee.onyx.server.scim.models import ScimPatchRequest
-from ee.onyx.server.scim.models import ScimUserResource
+from ee.onyx.server.scim.api import (
+    _check_seat_availability,
+    _scim_name_to_str,
+    create_user,
+    delete_user,
+    get_user,
+    list_users,
+    patch_user,
+    replace_user,
+)
+from ee.onyx.server.scim.models import (
+    ScimMappingFields,
+    ScimName,
+    ScimPatchOperation,
+    ScimPatchOperationType,
+    ScimPatchRequest,
+    ScimUserResource,
+)
 from ee.onyx.server.scim.patch import ScimPatchError
 from ee.onyx.server.scim.providers.base import ScimProvider
 from onyx.db.enums import AccountType
 from onyx.db.models import UserRole
-from tests.unit.onyx.server.scim.conftest import assert_scim_error
-from tests.unit.onyx.server.scim.conftest import make_db_user
-from tests.unit.onyx.server.scim.conftest import make_scim_user
-from tests.unit.onyx.server.scim.conftest import make_user_mapping
-from tests.unit.onyx.server.scim.conftest import parse_scim_list
-from tests.unit.onyx.server.scim.conftest import parse_scim_user
+from tests.unit.onyx.server.scim.conftest import (
+    assert_scim_error,
+    make_db_user,
+    make_scim_user,
+    make_user_mapping,
+    parse_scim_list,
+    parse_scim_user,
+)
 
 
 class TestListUsers:
@@ -446,6 +452,66 @@ class TestCreateUser:
         assert_scim_error(result, 409)
         mock_dal.rollback.assert_called_once()
 
+    @patch("ee.onyx.server.scim.api.is_unique_violation", return_value=True)
+    @patch("ee.onyx.server.scim.api.assign_user_to_default_groups__no_commit")
+    @patch("ee.onyx.server.scim.api._check_seat_availability", return_value=None)
+    def test_assign_default_groups_email_integrity_error_returns_409(
+        self,
+        mock_seats: MagicMock,  # noqa: ARG002
+        mock_assign: MagicMock,
+        mock_is_unique: MagicMock,  # noqa: ARG002
+        mock_db_session: MagicMock,
+        mock_token: MagicMock,
+        mock_dal: MagicMock,
+        provider: ScimProvider,
+    ) -> None:
+        """A concurrent duplicate create can surface as an ix_user_email
+        IntegrityError during default-group assignment (deferred autoflush)
+        rather than at ``add_user``. It must return a clean 409, not a 500."""
+        mock_dal.get_user_by_email.return_value = None
+        mock_assign.side_effect = IntegrityError("dup", {}, Exception())
+
+        result = create_user(
+            user_resource=make_scim_user(),
+            _token=mock_token,
+            provider=provider,
+            db_session=mock_db_session,
+        )
+
+        assert_scim_error(result, 409)
+        mock_dal.rollback.assert_called_once()
+        mock_dal.commit.assert_not_called()
+
+    @patch("ee.onyx.server.scim.api.is_unique_violation", return_value=False)
+    @patch("ee.onyx.server.scim.api.assign_user_to_default_groups__no_commit")
+    @patch("ee.onyx.server.scim.api._check_seat_availability", return_value=None)
+    def test_assign_default_groups_other_integrity_error_returns_500(
+        self,
+        mock_seats: MagicMock,  # noqa: ARG002
+        mock_assign: MagicMock,
+        mock_is_unique: MagicMock,  # noqa: ARG002
+        mock_db_session: MagicMock,
+        mock_token: MagicMock,
+        mock_dal: MagicMock,
+        provider: ScimProvider,
+    ) -> None:
+        """An integrity error NOT from the ix_user_email unique constraint (e.g.
+        a FK/other-constraint fault) must stay a structured 500 so real backend
+        faults aren't masked as a benign 409 'already exists'."""
+        mock_dal.get_user_by_email.return_value = None
+        mock_assign.side_effect = IntegrityError("fk", {}, Exception())
+
+        result = create_user(
+            user_resource=make_scim_user(),
+            _token=mock_token,
+            provider=provider,
+            db_session=mock_db_session,
+        )
+
+        assert_scim_error(result, 500)
+        mock_dal.rollback.assert_called_once()
+        mock_dal.commit.assert_not_called()
+
     @patch("ee.onyx.server.scim.api._check_seat_availability")
     def test_seat_limit_returns_403(
         self,
@@ -519,6 +585,63 @@ class TestReplaceUser:
         parse_scim_user(result)
         mock_dal.update_user.assert_called_once()
         mock_dal.commit.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "role", [UserRole.ADMIN, UserRole.CURATOR, UserRole.GLOBAL_CURATOR]
+    )
+    def test_moving_a_curator_or_admin_address_is_refused(
+        self,
+        mock_db_session: MagicMock,
+        mock_token: MagicMock,
+        mock_dal: MagicMock,
+        provider: ScimProvider,
+        role: UserRole,
+    ) -> None:
+        """A rename puts the account on an address the caller picked, and a row
+        no IdP owns yet is claimed by the first login for its address. Anything
+        above BASIC must not be movable by a token that can only grant BASIC."""
+        user = make_db_user(email="admin@example.com", role=role)
+        mock_dal.get_user.return_value = user
+        resource = make_scim_user(userName="attacker@example.com")
+
+        result = replace_user(
+            user_id=str(user.id),
+            user_resource=resource,
+            _token=mock_token,
+            provider=provider,
+            db_session=mock_db_session,
+        )
+
+        assert_scim_error(result, 403)
+        mock_dal.update_user.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "role", [UserRole.ADMIN, UserRole.CURATOR, UserRole.GLOBAL_CURATOR]
+    )
+    def test_privileged_update_without_a_rename_is_allowed(
+        self,
+        mock_db_session: MagicMock,
+        mock_token: MagicMock,
+        mock_dal: MagicMock,
+        provider: ScimProvider,
+        role: UserRole,
+    ) -> None:
+        """Only the address is off limits. Deprovisioning an admin still has to
+        work, or a departing one keeps their seat and their access."""
+        user = make_db_user(email="admin@example.com", role=role)
+        mock_dal.get_user.return_value = user
+        resource = make_scim_user(userName="Admin@Example.com", active=False)
+
+        result = replace_user(
+            user_id=str(user.id),
+            user_resource=resource,
+            _token=mock_token,
+            provider=provider,
+            db_session=mock_db_session,
+        )
+
+        parse_scim_user(result)
+        mock_dal.update_user.assert_called_once()
 
     def test_not_found_returns_404(
         self,
@@ -686,6 +809,38 @@ class TestPatchUser:
 
         parse_scim_user(result)
         mock_dal.update_user.assert_called_once()
+
+    def test_moving_a_curator_or_admin_address_is_refused(
+        self,
+        mock_db_session: MagicMock,
+        mock_token: MagicMock,
+        mock_dal: MagicMock,
+        provider: ScimProvider,
+    ) -> None:
+        """PATCH is what IdPs actually send, so the address guard has to hold
+        here and not only on PUT."""
+        user = make_db_user(email="admin@example.com", role=UserRole.ADMIN)
+        mock_dal.get_user.return_value = user
+        patch_req = ScimPatchRequest(
+            Operations=[
+                ScimPatchOperation(
+                    op=ScimPatchOperationType.REPLACE,
+                    path="userName",
+                    value="attacker@example.com",
+                )
+            ]
+        )
+
+        result = patch_user(
+            user_id=str(user.id),
+            patch_request=patch_req,
+            _token=mock_token,
+            provider=provider,
+            db_session=mock_db_session,
+        )
+
+        assert_scim_error(result, 403)
+        mock_dal.update_user.assert_not_called()
 
     @patch("ee.onyx.server.scim.api.assign_user_to_default_groups__no_commit")
     @patch("ee.onyx.server.scim.api._check_seat_availability", return_value=None)

@@ -40,6 +40,7 @@ export interface Settings {
   deep_research_enabled?: boolean;
   multi_model_chat_enabled?: boolean;
   search_ui_enabled?: boolean;
+  auto_detect_search_filters?: boolean;
 
   // Image processing settings
   image_extraction_and_analysis_enabled?: boolean;
@@ -58,6 +59,17 @@ export interface Settings {
 
   // Onyx Craft (Build Mode) feature flag
   onyx_craft_enabled?: boolean;
+
+  // Deployment-level Craft availability, ignoring workspace/per-user policy.
+  // Gates visibility of the admin Craft-access controls.
+  onyx_craft_available?: boolean;
+
+  // Workspace default for Craft access; per-user overrides win.
+  craft_default_enabled?: boolean;
+
+  // Workspace-wide instructions injected into every Craft agent's system
+  // prompt (AGENTS.md).
+  craft_instructions?: string | null;
 
   // Dev/debug flag: when true, the Craft UI renders an "Opencode pod logs"
   // button that streams the user's sandbox pod logs in real time. Backed
@@ -98,6 +110,10 @@ export interface Settings {
   // True when the backend runs inside a container (Docker/Podman).
   // Used to default local-service URLs to host.docker.internal.
   is_containerized?: boolean;
+
+  // PostHog client key + host for the web app; null = analytics off.
+  posthog_key?: string | null;
+  posthog_host?: string | null;
 }
 
 export interface NavigationItem {
@@ -137,7 +153,7 @@ export interface EnterpriseSettings {
 
 /**
  * Combined settings shape returned by the server-side `fetchSettingsSS`
- * helper in `components/settings/lib.ts`. Used only for SSR — client
+ * helper in `lib/settings/svcSS.ts`. Used only for SSR — client
  * components access settings via the SWR hooks in `lib/settings/hooks.ts`.
  */
 export interface CombinedSettings {
@@ -176,6 +192,13 @@ export interface AppSettings extends Settings {
   enterprise: EnterpriseSettings | null;
   /** Resolved display name: enterprise.application_name || "Onyx". */
   appName: string;
+  /**
+   * URL of the logo image to render, or `null` to use the default Onyx SVG.
+   * Includes a cache-buster that updates whenever enterprise settings are
+   * revalidated, forcing the browser to re-fetch after an admin uploads a
+   * new logo.
+   */
+  logoUrl: string | null;
   /** False when DISABLE_VECTOR_DB is set server-side. */
   vectorDbEnabled: boolean;
   isLoading: boolean;

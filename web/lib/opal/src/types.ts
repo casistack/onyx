@@ -21,7 +21,15 @@ import type { SVGProps } from "react";
  * This is the complete scale of size presets available in the design system.
  * Components needing the full range use this type directly.
  */
-export type SizeVariants = "fit" | "full" | "lg" | "md" | "sm" | "xs" | "2xs";
+export type SizeVariants =
+  | "fit"
+  | "full"
+  | "xl"
+  | "lg"
+  | "md"
+  | "sm"
+  | "xs"
+  | "2xs";
 
 // Convenience Size Types:
 //
@@ -35,7 +43,7 @@ export type SizeVariants = "fit" | "full" | "lg" | "md" | "sm" | "xs" | "2xs";
  * Used by components that control height, min-width, and padding.
  * Excludes "full" since containers need a fixed height preset.
  */
-export type ContainerSizeVariants = Exclude<SizeVariants, "full">;
+export type ContainerSizeVariants = Exclude<SizeVariants, "full" | "xl">;
 
 /**
  * Padding size variants.
@@ -59,12 +67,16 @@ export type PaddingVariants = Extract<
  *
  * | Variant | Class        |
  * |---------|--------------|
+ * | `xl`    | `rounded-20` |
  * | `lg`    | `rounded-16` |
  * | `md`    | `rounded-12` |
  * | `sm`    | `rounded-08` |
  * | `xs`    | `rounded-04` |
  */
-export type RoundingVariants = Extract<SizeVariants, "lg" | "md" | "sm" | "xs">;
+export type RoundingVariants = Extract<
+  SizeVariants,
+  "xl" | "lg" | "md" | "sm" | "xs"
+>;
 
 /**
  * Extreme size variants ("fit" and "full" only).
@@ -72,6 +84,18 @@ export type RoundingVariants = Extract<SizeVariants, "lg" | "md" | "sm" | "xs">;
  * Used for width and height properties that only support extremal values.
  */
 export type ExtremaSizeVariants = Extract<SizeVariants, "fit" | "full">;
+
+/**
+ * Shadow depth variants.
+ *
+ * | Variant  | Effect                          |
+ * |----------|---------------------------------|
+ * | `"none"` | No shadow (default)             |
+ * | `"sm"`   | Subtle lift (`--shadow-01`)     |
+ * | `"md"`   | Medium elevation (`--shadow-02`)|
+ * | `"lg"`   | Strong elevation (`--shadow-03`)|
+ */
+export type ShadowVariants = "none" | Extract<SizeVariants, "sm" | "md" | "lg">;
 
 /**
  * Size variants with numeric overrides.
@@ -123,7 +147,13 @@ export type BackgroundVariants = "none" | "light" | "heavy";
  * - `"danger"` — destructive / error state
  * - `"interactive"` — follows the interactive coloring system (`currentColor` / `--interactive-foreground`)
  */
-export type ColorTypes = "default" | "muted" | "danger" | "interactive";
+export type ColorTypes =
+  | "default"
+  | "muted"
+  | "success"
+  | "danger"
+  | "warning"
+  | "interactive";
 
 // ---------------------------------------------------------------------------
 // Status Variants
@@ -139,6 +169,7 @@ export type StatusVariants =
   | "info"
   | "success"
   | "warning"
+  | "pending"
   | "error";
 
 // ---------------------------------------------------------------------------

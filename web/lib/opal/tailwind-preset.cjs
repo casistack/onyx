@@ -229,6 +229,7 @@ module.exports = {
         "08": "var(--radius-08)",
         12: "var(--radius-12)",
         16: "var(--radius-16)",
+        20: "var(--radius-20)",
         full: "var(--radius-round)",
       },
       fontSize: {
@@ -238,10 +239,20 @@ module.exports = {
         description: "375",
         "token-bold": "bold",
       },
+      boxShadow: {
+        "box-00": "var(--shadow-box-00)",
+        "box-01": "var(--shadow-box-01)",
+        "box-02": "var(--shadow-box-02)",
+      },
       backdropBlur: {
         "01": "var(--backdrop-blur-01)",
         "02": "var(--backdrop-blur-02)",
         "03": "var(--backdrop-blur-03)",
+      },
+      zIndex: {
+        "settings-header": "var(--z-settings-header)",
+        popover: "var(--z-popover)",
+        tooltip: "var(--z-tooltip)",
       },
     },
   },

@@ -14,7 +14,8 @@ Coverage targets:
 - Wall-clock timeout posts abort + yields Error
 - ``GeneratorExit`` (browser disconnect) posts abort and re-raises
 - Permission-ask events trigger out-of-band POST (auto-allow)
-- ``stream_ready`` timeout when the bus never connects
+- ``stream_ready`` waits through transient reconnect windows before prompting
+- ``stream_ready`` timeout when the bus never reconnects
 """
 
 from __future__ import annotations
@@ -27,15 +28,26 @@ from typing import Any
 import httpx
 import pytest
 
-from onyx.server.features.build.sandbox.event_schema import AgentMessageChunk
-from onyx.server.features.build.sandbox.event_schema import AgentThoughtChunk
-from onyx.server.features.build.sandbox.event_schema import Error
-from onyx.server.features.build.sandbox.event_schema import PromptResponse
+from onyx.server.features.build.sandbox.event_schema import (
+    TURN_ERROR_CODE_TIMEOUT,
+    TURN_ERROR_CODE_TRANSPORT,
+    ActivityTimeoutError,
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    Error,
+    PromptResponse,
+)
+from onyx.server.features.build.sandbox.models import PromptAttachment
+from onyx.server.features.build.sandbox.opencode import serve_client
 from onyx.server.features.build.sandbox.opencode.event_bus import PodEventBus
-from onyx.server.features.build.sandbox.opencode.serve_client import ClientTimeouts
-from onyx.server.features.build.sandbox.opencode.serve_client import OpencodeServeClient
+from onyx.server.features.build.sandbox.opencode.serve_client import (
+    ClientTimeouts,
+    OpencodeServeClient,
+)
+from onyx.server.features.build.sandbox.sse import SSEKeepalive
 
 _SESSION = "ses_test_123"
+_CHILD_SESSION = "ses_child_456"
 _DIRECTORY = "/workspace/sessions/test-session"
 
 
@@ -58,10 +70,11 @@ class _RecordingTransport(httpx.MockTransport):
 
 
 @pytest.fixture
-def bus() -> Generator[PodEventBus, None, None]:
+def bus(monkeypatch: pytest.MonkeyPatch) -> Generator[PodEventBus, None, None]:
     """Bus with no real reader — tests push events directly into subscriber
     queues via ``bus._dispatch`` after ``stream_ready`` is forced set."""
     b = PodEventBus(base_url="http://test.invalid:4096", auth=None)
+    monkeypatch.setattr(b, "_ensure_reader_started", lambda: None)
     # The bus would normally set stream_ready inside its reader after
     # connecting. Force-set it here so send_message doesn't time out
     # waiting for a connection that's never going to happen in unit tests.
@@ -107,6 +120,8 @@ def _run_send_message(
     model_provider: str | None = None,
     model_id: str | None = None,
     timeout: float = 5.0,
+    absolute_timeout: float | None = None,
+    attachments: list[PromptAttachment] | None = None,
 ) -> tuple[list[Any], threading.Thread]:
     """Start ``send_message`` on a background thread, returning the
     collected events list (populated as the generator yields)."""
@@ -119,7 +134,9 @@ def _run_send_message(
             directory=_DIRECTORY,
             model_provider=model_provider,
             model_id=model_id,
+            attachments=attachments,
             timeout=timeout,
+            absolute_timeout=absolute_timeout,
         ):
             events.append(evt)
 
@@ -137,6 +154,12 @@ def _wait_for(predicate: Any, *, timeout: float = 3.0) -> bool:
     return False
 
 
+def _prompt_async_posted(transport: _RecordingTransport) -> bool:
+    return any(
+        request.url.path.endswith("/prompt_async") for request in transport.requests
+    )
+
+
 def _dispatch_session_idle(bus: PodEventBus, *, scoped: bool = True) -> None:
     properties = {"sessionID": _SESSION} if scoped else {}
     bus._dispatch({"type": "session.idle", "properties": properties})
@@ -152,6 +175,7 @@ def test_send_message_yields_text_and_terminator(bus: PodEventBus) -> None:
     client = _make_client(bus, transport)
     events, t = _run_send_message(client)
     try:
+        assert _wait_for(lambda: _prompt_async_posted(transport))
         # Set up: an assistant message arrives, then a text part with a delta,
         # then completion.
         bus._dispatch(
@@ -227,6 +251,7 @@ def test_send_message_routes_reasoning_to_thought_chunks(bus: PodEventBus) -> No
     client = _make_client(bus, transport)
     events, t = _run_send_message(client)
     try:
+        assert _wait_for(lambda: _prompt_async_posted(transport))
         # Reasoning part arrives first to register its type, then a delta on
         # the same partID — translator emits AgentThoughtChunk for reasoning.
         bus._dispatch(
@@ -321,6 +346,7 @@ def test_send_message_threads_model_override_into_prompt_async(
         client, model_provider="anthropic", model_id="claude-opus-4-7"
     )
     try:
+        assert _wait_for(lambda: len(posted_bodies) == 1)
         # Completion metadata arrives before the session-level terminator.
         bus._dispatch(
             {
@@ -364,6 +390,7 @@ def test_send_message_omits_model_when_override_missing(bus: PodEventBus) -> Non
     client = _make_client(bus, transport)
     events, t = _run_send_message(client)
     try:
+        assert _wait_for(lambda: len(posted_bodies) == 1)
         bus._dispatch(
             {
                 "type": "message.updated",
@@ -403,6 +430,7 @@ def test_send_message_omits_model_when_only_one_arg_supplied(
     client = _make_client(bus, transport)
     events, t = _run_send_message(client, model_provider="anthropic", model_id=None)
     try:
+        assert _wait_for(lambda: len(posted_bodies) == 1)
         bus._dispatch(
             {
                 "type": "message.updated",
@@ -423,6 +451,48 @@ def test_send_message_omits_model_when_only_one_arg_supplied(
         t.join(timeout=3.0)
 
     assert "model" not in posted_bodies[0]
+
+
+def test_send_message_posts_native_image_file_parts(bus: PodEventBus) -> None:
+    posted_bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/prompt_async"):
+            posted_bodies.append(httpx.Response(200, content=request.content).json())
+        return httpx.Response(204)
+
+    client = _make_client(bus, httpx.MockTransport(handler))
+    events, thread = _run_send_message(
+        client,
+        attachments=[
+            PromptAttachment(
+                name="reference image.png",
+                path="attachments/reference image.png",
+                mime_type="image/png",
+            )
+        ],
+    )
+    try:
+        assert _wait_for(lambda: len(posted_bodies) == 1)
+        _dispatch_session_idle(bus)
+        assert _wait_for(
+            lambda: any(isinstance(event, PromptResponse) for event in events)
+        )
+    finally:
+        thread.join(timeout=3.0)
+
+    assert posted_bodies[0]["parts"] == [
+        {"type": "text", "text": "hello"},
+        {
+            "type": "file",
+            "mime": "image/png",
+            "filename": "reference image.png",
+            "url": (
+                "file:///workspace/sessions/test-session/"
+                "attachments/reference%20image.png"
+            ),
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -464,24 +534,58 @@ def test_send_message_yields_error_on_prompt_async_connection_error(
     )
     assert len(events) == 1
     assert isinstance(events[0], Error)
-    assert events[0].code == -3
+    assert events[0].code == TURN_ERROR_CODE_TRANSPORT
     assert "prompt_async failed" in events[0].message
 
 
-def test_send_message_errors_when_stream_ready_never_set(bus: PodEventBus) -> None:
-    """If the bus never connects (stream_ready stays cleared), send_message
-    surfaces an Error after ``connect_timeout`` rather than blocking
-    indefinitely on prompt_async."""
+def test_send_message_waits_for_event_bus_reconnect_before_prompt_async(
+    bus: PodEventBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the shared /event stream is reconnecting, the turn should wait
+    instead of posting prompt_async and missing the first packets."""
+    monkeypatch.setattr(bus, "_ensure_reader_started", lambda: None)
     bus.stream_ready.clear()
-    transport = httpx.MockTransport(_ok_response)
-    client = _make_client(bus, transport, connect_timeout=0.2)
+
+    transport = _RecordingTransport(_ok_response)
+    client = _make_client(bus, transport, connect_timeout=0.05)
+    events, t = _run_send_message(client, timeout=3.0)
+    try:
+        time.sleep(0.1)
+        assert not any(
+            request.url.path.endswith("/prompt_async") for request in transport.requests
+        )
+
+        bus.stream_ready.set()
+        assert _wait_for(lambda: _prompt_async_posted(transport))
+
+        _dispatch_session_idle(bus)
+        assert _wait_for(lambda: any(isinstance(e, PromptResponse) for e in events))
+    finally:
+        t.join(timeout=3.0)
+
+
+def test_send_message_errors_when_stream_ready_never_set(
+    bus: PodEventBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the bus never connects (stream_ready stays cleared), send_message
+    surfaces an Error after the turn budget rather than blocking indefinitely
+    on prompt_async."""
+    monkeypatch.setattr(bus, "_ensure_reader_started", lambda: None)
+    bus.stream_ready.clear()
+    transport = _RecordingTransport(_ok_response)
+    client = _make_client(bus, transport, connect_timeout=0.01)
     events = list(
-        client.send_message(_SESSION, "hi", directory=_DIRECTORY, timeout=2.0)
+        client.send_message(_SESSION, "hi", directory=_DIRECTORY, timeout=0.2)
     )
     assert len(events) == 1
     assert isinstance(events[0], Error)
-    assert events[0].code == -3
+    assert events[0].code == TURN_ERROR_CODE_TRANSPORT
     assert "did not become ready" in events[0].message
+    assert not any(
+        request.url.path.endswith("/prompt_async") for request in transport.requests
+    )
 
 
 def test_send_message_errors_when_bus_closes_before_terminator(
@@ -551,8 +655,8 @@ def test_send_message_ends_on_unscoped_session_idle(bus: PodEventBus) -> None:
     assert not any(isinstance(e, Error) for e in events)
 
 
-def test_send_message_wall_clock_timeout_aborts(bus: PodEventBus) -> None:
-    """When the configured per-call timeout elapses with no terminator,
+def test_send_message_inactivity_timeout_aborts(bus: PodEventBus) -> None:
+    """When the configured inactivity timeout elapses with no terminator,
     the client posts ``/abort`` and yields a final Error."""
     aborts: list[str] = []
 
@@ -567,8 +671,114 @@ def test_send_message_wall_clock_timeout_aborts(bus: PodEventBus) -> None:
     events = list(
         client.send_message(_SESSION, "hi", directory=_DIRECTORY, timeout=0.3)
     )
-    assert any(isinstance(e, Error) and e.code == -1 for e in events)
+    # Inactivity timeout is the recoverable subtype so the executor can re-prompt.
+    assert any(isinstance(e, ActivityTimeoutError) for e in events)
     assert any("/abort" in p for p in aborts)
+
+
+def test_send_message_descendant_activity_renews_inactivity_timeout(
+    bus: PodEventBus,
+) -> None:
+    """Descendant packets keep an otherwise long-running parent turn alive."""
+    aborts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/abort"):
+            aborts.append(request.url.path)
+        return httpx.Response(204)
+
+    client = _make_client(bus, httpx.MockTransport(handler))
+    events, thread = _run_send_message(client, timeout=0.5)
+    try:
+        bus._dispatch(
+            {
+                "type": "session.created",
+                "properties": {"info": {"id": _CHILD_SESSION, "parentID": _SESSION}},
+            }
+        )
+        for index in range(4):
+            time.sleep(0.2)
+            bus._dispatch(
+                {
+                    "type": "message.updated",
+                    "properties": {
+                        "sessionID": _CHILD_SESSION,
+                        "info": {
+                            "id": f"msg-{index}",
+                            "sessionID": _CHILD_SESSION,
+                            "role": "assistant",
+                            "time": {"completed": None},
+                        },
+                    },
+                }
+            )
+        assert thread.is_alive()
+        _dispatch_session_idle(bus)
+        assert _wait_for(lambda: not thread.is_alive(), timeout=1.0)
+    finally:
+        thread.join(timeout=3.0)
+
+    assert any(isinstance(event, PromptResponse) for event in events)
+    assert not any(isinstance(event, Error) for event in events)
+    assert not aborts
+
+
+def test_send_message_keepalives_do_not_renew_inactivity_timeout(
+    bus: PodEventBus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transport keepalives cannot keep a stalled opencode turn alive."""
+    monkeypatch.setattr(serve_client, "SSE_KEEPALIVE_INTERVAL", 0.05)
+    client = _make_client(bus, httpx.MockTransport(_ok_response))
+
+    events = list(
+        client.send_message(_SESSION, "hi", directory=_DIRECTORY, timeout=0.2)
+    )
+
+    assert any(isinstance(event, SSEKeepalive) for event in events)
+    assert any(
+        isinstance(event, Error) and event.code == TURN_ERROR_CODE_TIMEOUT
+        for event in events
+    )
+
+
+def test_send_message_absolute_timeout_is_not_renewed(bus: PodEventBus) -> None:
+    """Continuous activity cannot extend an explicit hard turn budget."""
+    client = _make_client(bus, httpx.MockTransport(_ok_response))
+    events, thread = _run_send_message(
+        client,
+        timeout=0.5,
+        absolute_timeout=0.8,
+    )
+    try:
+        for index in range(6):
+            if not thread.is_alive():
+                break
+            time.sleep(0.2)
+            bus._dispatch(
+                {
+                    "type": "message.updated",
+                    "properties": {
+                        "sessionID": _SESSION,
+                        "info": {
+                            "id": f"msg-{index}",
+                            "sessionID": _SESSION,
+                            "role": "assistant",
+                            "time": {"completed": None},
+                        },
+                    },
+                }
+            )
+        assert _wait_for(lambda: not thread.is_alive(), timeout=1.0)
+    finally:
+        thread.join(timeout=3.0)
+
+    errors = [event for event in events if isinstance(event, Error)]
+    assert len(errors) == 1
+    assert errors[0].code == TURN_ERROR_CODE_TIMEOUT
+    assert errors[0].message == "Turn exceeded maximum duration"
+    # The hard budget timeout is NOT the recoverable subtype — it must not be
+    # re-prompted by the executor.
+    assert not isinstance(errors[0], ActivityTimeoutError)
 
 
 def test_send_message_aborts_on_generator_exit(bus: PodEventBus) -> None:
@@ -587,33 +797,46 @@ def test_send_message_aborts_on_generator_exit(bus: PodEventBus) -> None:
             aborts.append(request.url.path)
         return httpx.Response(204)
 
-    transport = httpx.MockTransport(handler)
+    transport = _RecordingTransport(handler)
     client = _make_client(bus, transport)
 
-    # Pre-load a non-terminator event into the subscriber queue BEFORE
-    # iterating, so the first ``next()`` returns quickly. We have to
-    # subscribe via the bus path the client uses, so let the client do
-    # its own subscribe; we just dispatch into the bus, which will route
-    # to that subscription.
     gen = client.send_message(_SESSION, "hi", directory=_DIRECTORY, timeout=5.0)
-    bus._dispatch(
-        {
-            "type": "message.updated",
-            "properties": {
-                "sessionID": _SESSION,
-                "info": {
-                    "id": "msg1",
+
+    def dispatch_first_chunk() -> None:
+        assert _wait_for(lambda: _prompt_async_posted(transport))
+        bus._dispatch(
+            {
+                "type": "message.updated",
+                "properties": {
                     "sessionID": _SESSION,
-                    "role": "assistant",
-                    "time": {"completed": None},
+                    "info": {
+                        "id": "msg1",
+                        "sessionID": _SESSION,
+                        "role": "assistant",
+                        "time": {"completed": None},
+                    },
                 },
-            },
-        }
-    )
-    # First yield drains the event we just dispatched. We don't care what
-    # the value is — only that the generator has executed past the POST
-    # and into the consume loop.
-    next(gen, None)
+            }
+        )
+        bus._dispatch(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": _SESSION,
+                    "part": {
+                        "id": "p1",
+                        "messageID": "msg1",
+                        "sessionID": _SESSION,
+                        "type": "text",
+                        "text": "partial",
+                        "state": {"status": "active"},
+                    },
+                },
+            }
+        )
+
+    threading.Thread(target=dispatch_first_chunk, daemon=True).start()
+    assert isinstance(next(gen), AgentMessageChunk)
     # Close mid-stream: this raises GeneratorExit inside send_message's
     # try/except, which posts /abort and re-raises.
     gen.close()
@@ -643,10 +866,11 @@ def test_send_message_auto_allows_permission_asks(bus: PodEventBus) -> None:
             )
         return httpx.Response(204)
 
-    transport = httpx.MockTransport(handler)
+    transport = _RecordingTransport(handler)
     client = _make_client(bus, transport)
     events, t = _run_send_message(client, timeout=3.0)
     try:
+        assert _wait_for(lambda: _prompt_async_posted(transport))
         bus._dispatch(
             {
                 "type": "permission.asked",

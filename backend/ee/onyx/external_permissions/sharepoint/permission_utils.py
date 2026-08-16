@@ -1,8 +1,7 @@
 import re
 import time
 from collections import deque
-from collections.abc import Callable
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -12,7 +11,11 @@ from office365.graph_client import GraphClient
 from office365.onedrive.driveitems.driveItem import DriveItem
 from office365.runtime.client_request import ClientRequestException
 from office365.sharepoint.client_context import ClientContext
-from office365.sharepoint.permissions.securable_object import RoleAssignmentCollection
+from office365.sharepoint.permissions.roles.definitions.definition import RoleDefinition
+from office365.sharepoint.permissions.securable_object import (
+    RoleAssignmentCollection,
+    SecurableObject,
+)
 from office365.sharepoint.principal.users.collection import UserCollection
 from pydantic import BaseModel
 
@@ -21,11 +24,15 @@ from onyx.access.models import ExternalAccess
 from onyx.access.utils import build_ext_group_name_for_onyx
 from onyx.configs.app_configs import REQUEST_TIMEOUT_SECONDS
 from onyx.configs.constants import DocumentSource
-from onyx.connectors.sharepoint.connector import GRAPH_API_MAX_RETRIES
-from onyx.connectors.sharepoint.connector import GRAPH_API_RETRYABLE_STATUSES
-from onyx.connectors.sharepoint.connector import SHARED_DOCUMENTS_MAP_REVERSE
-from onyx.connectors.sharepoint.connector import sleep_and_retry
+from onyx.connectors.sharepoint.connector import (
+    GRAPH_API_MAX_RETRIES,
+    GRAPH_API_RETRYABLE_STATUSES,
+    SHARED_DOCUMENTS_MAP_REVERSE,
+    sleep_and_retry,
+)
+from onyx.db.enums import HierarchyNodeType
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_after import parse_retry_after_seconds
 
 logger = setup_logger()
 
@@ -36,9 +43,10 @@ ANONYMOUS_USER_PRINCIPAL_TYPE = 3  # Anonymous/unauthenticated users (public acc
 AZURE_AD_GROUP_PRINCIPAL_TYPE = 4  # Azure Active Directory security groups
 SHAREPOINT_GROUP_PRINCIPAL_TYPE = 8  # SharePoint site groups (local to the site)
 MICROSOFT_DOMAIN = ".onmicrosoft"
-# Limited Access role type, limited access is a travel through permission not a actual permission
-LIMITED_ACCESS_ROLE_TYPES = [1, 9]
-LIMITED_ACCESS_ROLE_NAMES = ["Limited Access", "Web-Only Limited Access"]
+SHAREPOINT_GROUP_SCOPE_SEPARATOR = "::"
+# PnP RoleType defines Guest=1 and RestrictedGuest=9:
+# https://github.com/pnp/pnpcore/blob/4e4f58fcac797f2957bfcd14fedcecd690dfe7ee/src/sdk/PnP.Core/Model/SharePoint/Core/Public/Enums/RoleType.cs
+LIMITED_ACCESS_ROLE_TYPES = frozenset({1, 9})
 
 
 AD_GROUP_ENUMERATION_THRESHOLD = 100_000
@@ -52,6 +60,15 @@ AD_GROUP_ENUMERATION_THRESHOLD = 100_000
 # paged collections and keeps each page well under typical proxy buffer
 # limits while not making the round-trip count overwhelming.
 ROLE_ASSIGNMENTS_PAGE_SIZE = 100
+
+
+def _has_only_limited_access(
+    role_definition_bindings: Iterable[RoleDefinition],
+) -> bool:
+    return all(
+        binding.role_type_kind in LIMITED_ACCESS_ROLE_TYPES
+        for binding in role_definition_bindings
+    )
 
 
 def _graph_api_get(
@@ -71,7 +88,15 @@ def _graph_api_get(
                 resp.status_code in GRAPH_API_RETRYABLE_STATUSES
                 and attempt < GRAPH_API_MAX_RETRIES
             ):
-                wait = min(int(resp.headers.get("Retry-After", str(2**attempt))), 60)
+                parsed_retry_after = parse_retry_after_seconds(
+                    resp.headers.get("Retry-After")
+                )
+                wait = min(
+                    parsed_retry_after
+                    if parsed_retry_after is not None
+                    else float(2**attempt),
+                    60,
+                )
                 logger.warning(
                     "Graph API %s on attempt %s, retrying in %ss: %s",
                     resp.status_code,
@@ -194,49 +219,6 @@ def _get_group_guid_from_identifier(
         return None
 
 
-def _get_security_group_owners(graph_client: GraphClient, group_id: str) -> list[str]:
-    try:
-        # Get group owners using Graph API
-        group = graph_client.groups[group_id]
-        owners = sleep_and_retry(
-            group.owners.get_all(page_loaded=lambda _: None),
-            "get_security_group_owners",
-        )
-
-        owner_emails: list[str] = []
-        logger.info("Owners: %s", owners)
-
-        for owner in owners:
-            owner_data = owner.to_json()
-
-            # Extract email from the JSON data
-            mail: str | None = owner_data.get("mail")
-            user_principal_name: str | None = owner_data.get("userPrincipalName")
-
-            # Check if owner is a user and has an email
-            if mail:
-                if MICROSOFT_DOMAIN in mail:
-                    mail = mail.replace(MICROSOFT_DOMAIN, "")
-                owner_emails.append(mail)
-            elif user_principal_name:
-                if MICROSOFT_DOMAIN in user_principal_name:
-                    user_principal_name = user_principal_name.replace(
-                        MICROSOFT_DOMAIN, ""
-                    )
-                owner_emails.append(user_principal_name)
-
-        logger.info(
-            "Retrieved %s owners from security group %s", len(owner_emails), group_id
-        )
-        return owner_emails
-
-    except Exception as e:
-        logger.error(
-            "Failed to get security group owners for group %s: %s", group_id, e
-        )
-        return []
-
-
 def _get_sharepoint_list_item_id(drive_item: DriveItem) -> str | None:
     try:
         # First try to get the list item directly from the drive item
@@ -315,6 +297,14 @@ def _get_group_name_with_suffix(
     return f"{group_name}_{ad_group_suffix}"
 
 
+def _get_site_scoped_group_name(
+    client_context: ClientContext,
+    group_name: str,
+) -> str:
+    site_url = client_context.base_url.rstrip("/")
+    return f"{site_url}{SHAREPOINT_GROUP_SCOPE_SEPARATOR}{group_name}"
+
+
 def _get_sharepoint_groups(
     client_context: ClientContext, group_name: str, graph_client: GraphClient
 ) -> tuple[set[SharepointGroup], set[str]]:
@@ -351,6 +341,8 @@ def _get_sharepoint_groups(
                     name = _get_group_name_with_suffix(
                         user.login_name, name, graph_client
                     )
+                else:
+                    name = _get_site_scoped_group_name(client_context, name)
                 groups.add(
                     SharepointGroup(
                         login_name=user.login_name,
@@ -458,9 +450,6 @@ def _get_azuread_groups(
         group.members.get_all(page_loaded=process_members), "get_azuread_groups"
     )
 
-    owner_emails = _get_security_group_owners(graph_client, group_id)
-    user_emails.update(owner_emails)
-
     return groups, user_emails
 
 
@@ -526,23 +515,16 @@ def _get_groups_and_members_recursively(
     )
 
 
-def get_external_access_from_sharepoint(
+def _get_external_access_from_securable_object(
     client_context: ClientContext,
     graph_client: GraphClient,
-    drive_name: str | None,
-    drive_item: DriveItem | None,
-    site_page: dict[str, Any] | None,
+    securable_object: SecurableObject,
     add_prefix: bool = False,
-    treat_sharing_link_as_public: bool = False,
 ) -> ExternalAccess:
-    """
-    Get external access information from SharePoint.
-    """
     groups: set[SharepointGroup] = set()
     user_emails: set[str] = set()
     group_ids: set[str] = set()
 
-    # Add all members to a processing set first
     def add_user_and_group_to_sets(
         role_assignments: RoleAssignmentCollection,
     ) -> None:
@@ -553,23 +535,11 @@ def get_external_access_from_sharepoint(
         # callback and recurses until Python hits its max recursion depth.
         for assignment in role_assignments.current_page:
             logger.debug("Assignment: %s", assignment.to_json())
-            if assignment.role_definition_bindings:
-                is_limited_access = True
-                for role_definition_binding in assignment.role_definition_bindings:
-                    if (
-                        role_definition_binding.role_type_kind
-                        not in LIMITED_ACCESS_ROLE_TYPES
-                        or role_definition_binding.name not in LIMITED_ACCESS_ROLE_NAMES
-                    ):
-                        is_limited_access = False
-                        break
-
-                # Skip if the role is only Limited Access, because this is not a actual permission its a travel through permission
-                if is_limited_access:
-                    logger.info(
-                        "Skipping assignment because it has only Limited Access role"
-                    )
-                    continue
+            if assignment.role_definition_bindings and _has_only_limited_access(
+                assignment.role_definition_bindings
+            ):
+                logger.info("Skipping Limited Access-only assignment")
+                continue
             if assignment.member:
                 member = assignment.member
                 if member.principal_type == USER_PRINCIPAL_TYPE and hasattr(
@@ -588,6 +558,8 @@ def get_external_access_from_sharepoint(
                         name = _get_group_name_with_suffix(
                             member.login_name, name, graph_client
                         )
+                    else:
+                        name = _get_site_scoped_group_name(client_context, name)
                     groups.add(
                         SharepointGroup(
                             login_name=member.login_name,
@@ -596,6 +568,51 @@ def get_external_access_from_sharepoint(
                         )
                     )
 
+    sleep_and_retry(
+        securable_object.role_assignments.expand(
+            ["Member", "RoleDefinitionBindings"]
+        ).get_all(
+            page_size=ROLE_ASSIGNMENTS_PAGE_SIZE,
+            page_loaded=add_user_and_group_to_sets,
+        ),
+        "get_external_access_from_sharepoint",
+    )
+
+    groups_and_members = _get_groups_and_members_recursively(
+        client_context, graph_client, groups
+    )
+    if groups_and_members.found_public_group:
+        return ExternalAccess(
+            external_user_emails=set(),
+            external_user_group_ids=set(),
+            is_public=True,
+        )
+
+    for group_name in groups_and_members.groups_to_emails:
+        if add_prefix:
+            group_name = build_ext_group_name_for_onyx(
+                group_name, DocumentSource.SHAREPOINT
+            )
+        group_ids.add(group_name.lower())
+
+    logger.info("User emails: %s", len(user_emails))
+    logger.info("Group IDs: %s", len(group_ids))
+    return ExternalAccess(
+        external_user_emails=user_emails,
+        external_user_group_ids=group_ids,
+        is_public=False,
+    )
+
+
+def get_external_access_from_sharepoint(
+    client_context: ClientContext,
+    graph_client: GraphClient,
+    drive_name: str | None,
+    drive_item: DriveItem | None,
+    site_page: dict[str, Any] | None,
+    add_prefix: bool = False,
+    treat_sharing_link_as_public: bool = False,
+) -> ExternalAccess:
     if drive_item and drive_name:
         is_public = _is_public_item(drive_item, treat_sharing_link_as_public)
         if is_public:
@@ -619,14 +636,6 @@ def get_external_access_from_sharepoint(
         item = client_context.web.lists.get_by_title(drive_name).items.get_by_id(
             item_id
         )
-
-        sleep_and_retry(
-            item.role_assignments.expand(["Member", "RoleDefinitionBindings"]).get_all(
-                page_size=ROLE_ASSIGNMENTS_PAGE_SIZE,
-                page_loaded=add_user_and_group_to_sets,
-            ),
-            "get_external_access_from_sharepoint",
-        )
     elif site_page:
         site_url = site_page.get("webUrl")
         # Keep percent-encoding intact so the path matches the encoding
@@ -639,43 +648,42 @@ def get_external_access_from_sharepoint(
             server_relative_url
         )
         item = file_obj.listItemAllFields
-
-        sleep_and_retry(
-            item.role_assignments.expand(["Member", "RoleDefinitionBindings"]).get_all(
-                page_size=ROLE_ASSIGNMENTS_PAGE_SIZE,
-                page_loaded=add_user_and_group_to_sets,
-            ),
-            "get_external_access_from_sharepoint",
-        )
     else:
         raise RuntimeError("No drive item or site page provided")
 
-    groups_and_members: GroupsResult = _get_groups_and_members_recursively(
-        client_context, graph_client, groups
+    return _get_external_access_from_securable_object(
+        client_context,
+        graph_client,
+        item,
+        add_prefix,
     )
 
-    # If the site is public, w have default groups assigned to it, so we return early
-    if groups_and_members.found_public_group:
-        return ExternalAccess(
-            external_user_emails=set(),
-            external_user_group_ids=set(),
-            is_public=True,
-        )
 
-    for group_name, _ in groups_and_members.groups_to_emails.items():
-        if add_prefix:
-            group_name = build_ext_group_name_for_onyx(
-                group_name, DocumentSource.SHAREPOINT
-            )
-        group_ids.add(group_name.lower())
+def get_hierarchy_node_external_access_from_sharepoint(
+    client_context: ClientContext,
+    graph_client: GraphClient,
+    node_type: HierarchyNodeType,
+    drive_name: str | None,
+    folder_url: str | None,
+) -> ExternalAccess:
+    if node_type == HierarchyNodeType.SITE:
+        securable_object = client_context.web
+    elif node_type == HierarchyNodeType.DRIVE and drive_name:
+        list_name = SHARED_DOCUMENTS_MAP_REVERSE.get(drive_name, drive_name)
+        securable_object = client_context.web.lists.get_by_title(list_name)
+    elif node_type == HierarchyNodeType.FOLDER and folder_url:
+        server_relative_url = urlparse(folder_url).path
+        securable_object = client_context.web.get_folder_by_server_relative_url(
+            server_relative_url
+        ).list_item_all_fields
+    else:
+        raise ValueError(f"Unsupported SharePoint hierarchy node: {node_type}")
 
-    logger.info("User emails: %s", len(user_emails))
-    logger.info("Group IDs: %s", len(group_ids))
-
-    return ExternalAccess(
-        external_user_emails=user_emails,
-        external_user_group_ids=group_ids,
-        is_public=False,
+    return _get_external_access_from_securable_object(
+        client_context,
+        graph_client,
+        securable_object,
+        add_prefix=True,
     )
 
 
@@ -747,24 +755,11 @@ def get_sharepoint_external_groups(
         # via `_get_next().execute_query()`, which re-fires this `page_loaded`
         # callback and recurses until Python hits its max recursion depth.
         for assignment in role_assignments.current_page:
-            if assignment.role_definition_bindings:
-                is_limited_access = True
-                for role_definition_binding in assignment.role_definition_bindings:
-                    if (
-                        role_definition_binding.role_type_kind
-                        not in LIMITED_ACCESS_ROLE_TYPES
-                        or role_definition_binding.name not in LIMITED_ACCESS_ROLE_NAMES
-                    ):
-                        is_limited_access = False
-                        break
-
-                # Skip if the role assignment is only Limited Access, because this is not a actual permission its
-                #  a travel through permission
-                if is_limited_access:
-                    logger.info(
-                        "Skipping assignment because it has only Limited Access role"
-                    )
-                    continue
+            if assignment.role_definition_bindings and _has_only_limited_access(
+                assignment.role_definition_bindings
+            ):
+                logger.info("Skipping Limited Access-only assignment")
+                continue
             if assignment.member:
                 member = assignment.member
                 if member.principal_type in [
@@ -776,6 +771,8 @@ def get_sharepoint_external_groups(
                         name = _get_group_name_with_suffix(
                             member.login_name, name, graph_client
                         )
+                    else:
+                        name = _get_site_scoped_group_name(client_context, name)
 
                     groups.add(
                         SharepointGroup(

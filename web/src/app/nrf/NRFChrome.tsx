@@ -18,7 +18,7 @@ import useAppFocus from "@/hooks/useAppFocus";
 import { useQueryController } from "@/providers/QueryControllerProvider";
 import { useTierAtLeast } from "@/hooks/useTierAtLeast";
 import { Tier } from "@/lib/settings/types";
-import { useSidebarState } from "@/layouts/sidebar-layouts";
+import { useSidebarState } from "@opal/layouts";
 import useScreenSize from "@/hooks/useScreenSize";
 
 const footerMarkdownComponents = {
@@ -90,6 +90,7 @@ export default function NRFChrome() {
             <Button
               prominence="internal"
               icon={SvgSidebar}
+              aria-label="Open Sidebar"
               onClick={() => setFolded(false)}
             />
           )}

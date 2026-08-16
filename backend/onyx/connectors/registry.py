@@ -116,6 +116,10 @@ CONNECTOR_CLASS_MAP = {
         module_path="onyx.connectors.loopio.connector",
         class_name="LoopioConnector",
     ),
+    DocumentSource.BOX: ConnectorMapping(
+        module_path="onyx.connectors.box.connector",
+        class_name="BoxConnector",
+    ),
     DocumentSource.DROPBOX: ConnectorMapping(
         module_path="onyx.connectors.dropbox.connector",
         class_name="DropboxConnector",
@@ -215,6 +219,14 @@ CONNECTOR_CLASS_MAP = {
     DocumentSource.TESTRAIL: ConnectorMapping(
         module_path="onyx.connectors.testrail.connector",
         class_name="TestRailConnector",
+    ),
+    DocumentSource.BRAINTRUST: ConnectorMapping(
+        module_path="onyx.connectors.braintrust.connector",
+        class_name="BraintrustConnector",
+    ),
+    DocumentSource.LUMAPPS: ConnectorMapping(
+        module_path="onyx.connectors.lumapps.connector",
+        class_name="LumAppsConnector",
     ),
     # just for integration tests
     DocumentSource.MOCK_CONNECTOR: ConnectorMapping(

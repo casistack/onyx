@@ -1,4 +1,4 @@
-"""Unit tests for `streaming._merge_events_with_announces`.
+"""Unit tests for `streaming.merge_events_with_announces`.
 
 The merger is a generator that interleaves a synchronous event iterator with
 approval-announce events drained from a Redis-style BLPOP. Two daemon threads
@@ -11,12 +11,15 @@ import time
 from collections.abc import Generator
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import UUID
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
-from onyx.server.features.build.api.packets import ApprovalRequestedPacket
+from onyx.server.features.build.connect_app import ConnectAppRequest
+from onyx.server.features.build.packets import (
+    ApprovalRequestedPacket,
+    ConnectAppRequestPacket,
+)
 from onyx.server.features.build.session import streaming as streaming_mod
 
 
@@ -71,7 +74,7 @@ def test_events_only_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
         yield "c"
 
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=uuid4(), tenant_id="public"
         )
     )
@@ -107,7 +110,7 @@ def test_announce_emitted_as_approval_requested_packet(
         yield "events-end"
 
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=session_id, tenant_id="public"
         )
     )
@@ -119,12 +122,64 @@ def test_announce_emitted_as_approval_requested_packet(
     assert packet.session_id == session_id
     assert packet.type == "approval_requested"
 
-    # Verify the SSE-frame shape the caller produces from this packet.
-    rendered = packet.model_dump_json(by_alias=True)
-    parsed = json.loads(rendered)
+    # Verify the SSE-frame shape the attach stream produces from this packet.
+    rendered = streaming_mod.event_to_sse(packet)
+    assert rendered.startswith("event: message\n")
+    parsed = json.loads(rendered.split("data: ", 1)[1])
     assert parsed["type"] == "approval_requested"
     assert parsed["approval_id"] == str(approval_id)
     assert parsed["session_id"] == str(session_id)
+
+
+def test_connect_app_announce_emitted_as_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect-app announce is injected into the stream as a
+    ConnectAppRequestPacket (the turn-driving worker can't reach the browser, so
+    the card crosses over via this announce)."""
+    session_id = uuid4()
+    request = ConnectAppRequest(
+        request_id="req-9", external_app_id=42, reason="post a message"
+    )
+    announce_enqueued = threading.Event()
+    calls: list[int] = []
+
+    def pop_connect(_sid: str, timeout_s: int, cache: Any) -> ConnectAppRequest | None:  # noqa: ARG001 — kwarg name must match production caller
+        calls.append(1)
+        if len(calls) == 1:
+            return request
+        announce_enqueued.set()
+        time.sleep(min(0.02, float(timeout_s)))
+        return None
+
+    _stub_get_cache_backend(monkeypatch)
+    _stub_pop_announcement(monkeypatch, _always_none)  # approval pump: nothing
+    monkeypatch.setattr(streaming_mod.connect_app, "pop_announcement", pop_connect)
+
+    def events() -> Generator[str, None, None]:
+        assert announce_enqueued.wait(timeout=2.0), "connect-app packet never enqueued"
+        yield "events-end"
+
+    out = _collect_with_timeout(
+        streaming_mod.merge_events_with_announces(
+            events(), session_id=session_id, tenant_id="public"
+        )
+    )
+
+    packets = [item for item in out if isinstance(item, ConnectAppRequestPacket)]
+    assert len(packets) == 1
+    assert packets[0].request_id == "req-9"
+    assert packets[0].external_app_id == 42
+    assert packets[0].reason == "post a message"
+    assert packets[0].type == "connect_app_request"
+
+    # Verify the SSE-frame shape the attach stream produces from this packet.
+    rendered = streaming_mod.event_to_sse(packets[0])
+    assert rendered.startswith("event: message\n")
+    parsed = json.loads(rendered.split("data: ", 1)[1])
+    assert parsed["type"] == "connect_app_request"
+    assert parsed["request_id"] == "req-9"
+    assert parsed["external_app_id"] == 42
 
 
 def test_interleaving_events_and_announce(
@@ -164,7 +219,7 @@ def test_interleaving_events_and_announce(
         yield "y"
 
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=session_id, tenant_id="public"
         )
     )
@@ -187,7 +242,7 @@ def test_terminates_when_event_iterator_ends(
 
     # Generator must finish even though the announce thread would BLPOP forever.
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=uuid4(), tenant_id="public"
         ),
         timeout_s=1.0,
@@ -208,7 +263,7 @@ def test_no_deadlock_when_announce_thread_sees_nothing(
         yield "q"
 
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=uuid4(), tenant_id="public"
         )
     )
@@ -264,7 +319,7 @@ def test_pop_announcement_exception_is_swallowed(
         yield "still-ok"
 
     out = _collect_with_timeout(
-        streaming_mod._merge_events_with_announces(
+        streaming_mod.merge_events_with_announces(
             events(), session_id=uuid4(), tenant_id="public"
         )
     )

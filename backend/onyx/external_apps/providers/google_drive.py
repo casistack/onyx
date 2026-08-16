@@ -1,18 +1,23 @@
-from onyx.configs.app_configs import EXT_APP_GOOGLE_DRIVE_CLIENT_ID
-from onyx.configs.app_configs import EXT_APP_GOOGLE_DRIVE_CLIENT_SECRET
-from onyx.db.enums import EndpointPolicy
-from onyx.db.enums import ExternalAppType
-from onyx.external_apps.providers.actions import EndpointSpec
-from onyx.external_apps.providers.actions import ExternalAppAction
-from onyx.external_apps.providers.actions import RestRoute
+from onyx.configs.app_configs import (
+    EXT_APP_GOOGLE_DRIVE_CLIENT_ID,
+    EXT_APP_GOOGLE_DRIVE_CLIENT_SECRET,
+)
+from onyx.db.enums import EndpointPolicy, ExternalAppType
+from onyx.external_apps.providers.actions import (
+    EndpointSpec,
+    ExternalAppAction,
+    RestRoute,
+)
 from onyx.external_apps.providers.base import OnyxManagedExtApp
 from onyx.external_apps.providers.google_base import GoogleOAuthProvider
 
 
 # Google Drive API v3. Reads (GET) live under `/drive/v3/...`; content uploads
 # use the separate `/upload/drive/v3/...` host path, so both prefixes appear in
-# the upstream patterns and the catalog. Reads default to ALWAYS; every mutation
-# defaults to ASK so the egress approval gate prompts the user before it runs.
+# the upstream patterns and the catalog. The Google Docs API is a separate host
+# (`docs.googleapis.com/v1/documents/...`) authorized by the same `auth/drive`
+# scope. Reads default to ALWAYS; every mutation defaults to ASK so the egress
+# approval gate prompts the user before it runs.
 class GoogleDriveAction(ExternalAppAction):
     """Strongly-typed catalog ids for the Google Drive provider."""
 
@@ -22,12 +27,17 @@ class GoogleDriveAction(ExternalAppAction):
     FILES_CREATE = "gdrive.files.create"
     FILES_UPDATE = "gdrive.files.update"
     FILES_DELETE = "gdrive.files.delete"
+    DOCS_READ = "gdrive.docs.read"
+    DOCS_CREATE = "gdrive.docs.create"
+    DOCS_UPDATE = "gdrive.docs.update"
 
 
 _FILES = "/drive/v3/files"
 _FILE_ITEM = f"{_FILES}/{{fileId}}"
 _UPLOAD_FILES = "/upload/drive/v3/files"
 _UPLOAD_ITEM = f"{_UPLOAD_FILES}/{{fileId}}"
+_DOCS = "/v1/documents"
+_DOC_ITEM = f"{_DOCS}/{{documentId}}"
 _ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         id=GoogleDriveAction.FILES_READ,
@@ -89,6 +99,28 @@ _ENDPOINTS: list[EndpointSpec] = [
         description="Trash or permanently delete a file.",
         matches=(RestRoute(method="DELETE", path=_FILE_ITEM),),
     ),
+    EndpointSpec(
+        id=GoogleDriveAction.DOCS_READ,
+        normalised_name="Read a document",
+        description=(
+            "Read a Google Doc's structured contents (text, formatting, and "
+            "layout) via the Docs API."
+        ),
+        matches=(RestRoute(method="GET", path=_DOC_ITEM),),
+        default_policy=EndpointPolicy.ALWAYS,
+    ),
+    EndpointSpec(
+        id=GoogleDriveAction.DOCS_CREATE,
+        normalised_name="Create a document",
+        description="Create a new, empty Google Doc via the Docs API.",
+        matches=(RestRoute(method="POST", path=_DOCS),),
+    ),
+    EndpointSpec(
+        id=GoogleDriveAction.DOCS_UPDATE,
+        normalised_name="Edit a document",
+        description="Apply edits to a Google Doc's contents via the Docs API.",
+        matches=(RestRoute(method="POST", path=_DOC_ITEM),),
+    ),
 ]
 
 
@@ -103,12 +135,10 @@ class GoogleDriveProvider(GoogleOAuthProvider, OnyxManagedExtApp):
             "https://www\\.googleapis\\.com/drive/.*",
             # Content uploads use the separate /upload host path.
             "https://www\\.googleapis\\.com/upload/drive/.*",
+            # The Docs API lives on its own host.
+            "https://docs\\.googleapis\\.com/.*",
         ],
-        description=(
-            "Search, read, create, and edit files in your Google Drive inside "
-            "Onyx Craft."
-        ),
-        google_api_name="Google Drive API",
+        google_api_name="Google Drive API and Google Docs API",
         endpoint_catalog=_ENDPOINTS,
     )
 

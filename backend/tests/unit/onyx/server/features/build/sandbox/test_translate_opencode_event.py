@@ -1,9 +1,8 @@
 """Unit tests for ``translate_opencode_event``.
 
 Pure-function tests against canned opencode ``/event`` payloads. Locks
-the wire contract documented in
-``docs/craft/opencode-serve-test-report.md`` so regressions surface here.
-No network, no subprocess, no real opencode serve.
+the observed wire contract so regressions surface here. No network, no
+subprocess, no real opencode serve.
 """
 
 from __future__ import annotations
@@ -12,19 +11,24 @@ from typing import Any
 
 import pytest
 
-from onyx.server.features.build.sandbox.event_schema import AgentMessageChunk
-from onyx.server.features.build.sandbox.event_schema import AgentThoughtChunk
-from onyx.server.features.build.sandbox.event_schema import Error
-from onyx.server.features.build.sandbox.event_schema import PromptResponse
-from onyx.server.features.build.sandbox.event_schema import ToolCallProgress
-from onyx.server.features.build.sandbox.event_schema import ToolCallStart
+from onyx.server.features.build.packets import (
+    CompactionPacket,
+    ContextUsagePacket,
+    SubagentStartedPacket,
+)
+from onyx.server.features.build.sandbox.event_schema import (
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    Error,
+    PromptResponse,
+    ToolCallProgress,
+    ToolCallStart,
+)
 from onyx.server.features.build.sandbox.opencode.serve_client import (
     _synthesize_tool_content,
-)
-from onyx.server.features.build.sandbox.opencode.serve_client import _tool_status
-from onyx.server.features.build.sandbox.opencode.serve_client import _TurnState
-from onyx.server.features.build.sandbox.opencode.serve_client import _wrap_raw_output
-from onyx.server.features.build.sandbox.opencode.serve_client import (
+    _tool_status,
+    _TurnState,
+    _wrap_raw_output,
     translate_opencode_event,
 )
 
@@ -596,6 +600,32 @@ def test_message_updated_with_error_emits_error_event() -> None:
                         "role": "assistant",
                         "time": {"completed": 1779000000000},
                         "error": {
+                            "name": "UnknownError",
+                            "data": {"message": "Model not found."},
+                        },
+                    }
+                },
+            },
+            s,
+        )
+    )
+    assert len(out) == 1
+    assert isinstance(out[0], Error)
+    assert "Model not found" in out[0].message
+
+
+def test_message_aborted_emits_cancelled_terminal() -> None:
+    s = _state()
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "sessionID": SESS,
+                        "role": "assistant",
+                        "time": {"completed": 1779000000000},
+                        "error": {
                             "name": "MessageAbortedError",
                             "data": {"message": "Aborted"},
                         },
@@ -606,8 +636,8 @@ def test_message_updated_with_error_emits_error_event() -> None:
         )
     )
     assert len(out) == 1
-    assert isinstance(out[0], Error)
-    assert "Aborted" in out[0].message
+    assert isinstance(out[0], PromptResponse)
+    assert out[0].stop_reason == "cancelled"
 
 
 def test_duplicate_session_error_silenced_after_first() -> None:
@@ -1287,6 +1317,43 @@ def _child_parent_resolver(sess_id: str) -> str | None:
     return PARENT if sess_id == CHILD else None
 
 
+def test_session_created_emits_subagent_started_for_parent() -> None:
+    s = _parent_state()
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "session.created",
+                "properties": {
+                    "info": {"id": CHILD, "parentID": PARENT},
+                },
+            },
+            s,
+        )
+    )
+
+    assert len(out) == 1
+    assert isinstance(out[0], SubagentStartedPacket)
+    assert out[0].subagent_session_id == CHILD
+    assert out[0].parent_session_id == PARENT
+
+
+def test_session_created_for_other_parent_is_ignored() -> None:
+    s = _parent_state()
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "session.created",
+                "properties": {
+                    "info": {"id": CHILD, "parentID": "ses_OTHER"},
+                },
+            },
+            s,
+        )
+    )
+
+    assert out == []
+
+
 def test_child_tool_event_forwarded_and_tagged() -> None:
     """A completed tool event from a descendant subagent session is forwarded
     and tagged with sessionId + parentSessionId routing metadata."""
@@ -1310,6 +1377,204 @@ def test_child_tool_event_forwarded_and_tagged() -> None:
         assert meta["parentSessionId"] == PARENT
         # Existing toolName tag is preserved (merge, not overwrite).
         assert meta["toolName"] == "bash"
+
+
+def test_child_text_delta_forwarded_and_tagged() -> None:
+    """Visible child text should stream into the subagent transcript rather
+    than being dropped while the parent task is still running."""
+    s = _parent_state()
+
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": CHILD,
+                    "messageID": "msg_child",
+                    "partID": "p_child_text",
+                    "field": "text",
+                    "delta": "child response",
+                },
+            },
+            s,
+            parent_resolver=_child_parent_resolver,
+            fetch_message_by_session=lambda session_id, message_id: {
+                "info": {
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                },
+                "parts": [{"id": "p_child_text", "type": "text"}],
+            },
+        )
+    )
+
+    assert len(out) == 1
+    assert isinstance(out[0], AgentMessageChunk)
+    assert out[0].content.text == "child response"  # type: ignore[union-attr]
+    meta = out[0].field_meta
+    assert meta is not None
+    assert meta["sessionId"] == CHILD
+    assert meta["parentSessionId"] == PARENT
+
+
+def test_child_reasoning_part_forwarded_and_tagged() -> None:
+    s = _parent_state()
+
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.part.updated",
+                "properties": {
+                    "sessionID": CHILD,
+                    "part": {
+                        "id": "p_child_reasoning",
+                        "messageID": "msg_child",
+                        "type": "reasoning",
+                        "text": "child thinking",
+                    },
+                },
+            },
+            s,
+            parent_resolver=_child_parent_resolver,
+            fetch_message_by_session=lambda session_id, message_id: {
+                "info": {
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                },
+                "parts": [{"id": "p_child_reasoning", "type": "reasoning"}],
+            },
+        )
+    )
+
+    assert len(out) == 1
+    assert isinstance(out[0], AgentThoughtChunk)
+    assert out[0].content.text == "child thinking"  # type: ignore[union-attr]
+    meta = out[0].field_meta
+    assert meta is not None
+    assert meta["sessionId"] == CHILD
+    assert meta["parentSessionId"] == PARENT
+
+
+def test_child_reasoning_delta_forwarded_and_tagged() -> None:
+    s = _parent_state()
+
+    out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": CHILD,
+                    "messageID": "msg_child",
+                    "partID": "p_child_reasoning",
+                    "field": "text",
+                    "delta": "child thinking",
+                },
+            },
+            s,
+            parent_resolver=_child_parent_resolver,
+            fetch_message_by_session=lambda session_id, message_id: {
+                "info": {
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                },
+                "parts": [{"id": "p_child_reasoning", "type": "reasoning"}],
+            },
+        )
+    )
+
+    assert len(out) == 1
+    assert isinstance(out[0], AgentThoughtChunk)
+    assert out[0].content.text == "child thinking"  # type: ignore[union-attr]
+    meta = out[0].field_meta
+    assert meta is not None
+    assert meta["sessionId"] == CHILD
+    assert meta["parentSessionId"] == PARENT
+
+
+def test_child_finish_does_not_leak_into_parent_terminator() -> None:
+    s = _parent_state()
+
+    _drain(
+        translate_opencode_event(
+            {
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": CHILD,
+                    "info": {
+                        "id": "msg_child",
+                        "sessionID": CHILD,
+                        "role": "assistant",
+                        "finish": "max_tokens",
+                    },
+                },
+            },
+            s,
+            parent_resolver=_child_parent_resolver,
+        )
+    )
+    out = _drain(
+        translate_opencode_event(
+            {"type": "session.idle", "properties": {"sessionID": PARENT}}, s
+        )
+    )
+
+    assert len(out) == 1
+    assert isinstance(out[0], PromptResponse)
+    assert out[0].stop_reason == "end_turn"
+
+
+def test_child_part_type_does_not_collide_with_parent_part_id() -> None:
+    s = _parent_state()
+
+    child_out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": CHILD,
+                    "messageID": "msg_child",
+                    "partID": "shared_part",
+                    "field": "text",
+                    "delta": "child thinking",
+                },
+            },
+            s,
+            parent_resolver=_child_parent_resolver,
+            fetch_message_by_session=lambda session_id, message_id: {
+                "info": {
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                },
+                "parts": [{"id": "shared_part", "type": "reasoning"}],
+            },
+        )
+    )
+    assert isinstance(child_out[0], AgentThoughtChunk)
+
+    s.assistant_message_ids.add("msg_parent")
+    parent_out = _drain(
+        translate_opencode_event(
+            {
+                "type": "message.part.delta",
+                "properties": {
+                    "sessionID": PARENT,
+                    "messageID": "msg_parent",
+                    "partID": "shared_part",
+                    "field": "text",
+                    "delta": "parent visible text",
+                },
+            },
+            s,
+        )
+    )
+
+    assert len(parent_out) == 1
+    assert isinstance(parent_out[0], AgentMessageChunk)
+    assert parent_out[0].content.text == "parent visible text"  # type: ignore[union-attr]
 
 
 def test_child_tool_event_dropped_when_not_descendant() -> None:
@@ -1408,3 +1673,192 @@ def test_parent_non_task_tool_event_not_tagged() -> None:
         assert meta is not None
         assert "subagentSessionId" not in meta
         assert meta["toolName"] == "bash"
+
+
+# ───────────────────────── exit-code / error-state mapping ────────
+
+
+def test_bash_completed_with_nonzero_exit_maps_to_failed() -> None:
+    s = _state()
+    _drain(translate_opencode_event(_tool_event("c1", "bash", "pending"), s))
+    out = _drain(
+        translate_opencode_event(
+            _tool_event(
+                "c1",
+                "bash",
+                "completed",
+                input={"command": "sudo do-thing"},
+                output="permission denied",
+                metadata={"exit": 1},
+            ),
+            s,
+        )
+    )
+    assert len(out) == 1
+    assert isinstance(out[0], ToolCallProgress)
+    assert out[0].status == "failed"
+    assert out[0].raw_output is not None
+    assert out[0].raw_output.get("output") == "permission denied"  # type: ignore[union-attr]
+    assert out[0].raw_output.get("metadata") == {"exit": 1}  # type: ignore[union-attr]
+
+
+def test_bash_first_sighting_completed_with_nonzero_exit_dual_emits_failed() -> None:
+    """First sighting that already carries completed-with-nonzero-exit state
+    emits ToolCallStart plus a ToolCallProgress with the overridden status."""
+    s = _state()
+    out = _drain(
+        translate_opencode_event(
+            _tool_event(
+                "c1",
+                "bash",
+                "completed",
+                input={"command": "false"},
+                output="",
+                metadata={"exit": 1},
+            ),
+            s,
+        )
+    )
+    assert len(out) == 2
+    assert isinstance(out[0], ToolCallStart)
+    assert isinstance(out[1], ToolCallProgress)
+    assert out[1].status == "failed"
+
+
+def test_bash_completed_with_zero_exit_stays_completed() -> None:
+    s = _state()
+    _drain(translate_opencode_event(_tool_event("c1", "bash", "pending"), s))
+    out = _drain(
+        translate_opencode_event(
+            _tool_event(
+                "c1",
+                "bash",
+                "completed",
+                input={"command": "ls"},
+                output="file1\nfile2\n",
+                metadata={"exit": 0},
+            ),
+            s,
+        )
+    )
+    assert len(out) == 1
+    assert isinstance(out[0], ToolCallProgress)
+    assert out[0].status == "completed"
+
+
+def test_tool_error_state_maps_to_failed_with_error_output() -> None:
+    s = _state()
+    _drain(translate_opencode_event(_tool_event("c1", "bash", "pending"), s))
+    out = _drain(
+        translate_opencode_event(
+            _tool_event(
+                "c1",
+                "bash",
+                "error",
+                error="sudo: a password is required",
+            ),
+            s,
+        )
+    )
+    assert len(out) == 1
+    assert isinstance(out[0], ToolCallProgress)
+    assert out[0].status == "failed"
+    assert out[0].raw_output is not None
+    assert out[0].raw_output.get("output") == "sudo: a password is required"  # type: ignore[union-attr]
+
+
+def _msg_updated(
+    msg_id: str,
+    *,
+    tokens: dict[str, Any] | None = None,
+    cost: float | None = None,
+    summary: bool | None = None,
+) -> dict[str, Any]:
+    info: dict[str, Any] = {"role": "assistant", "id": msg_id, "sessionID": SESS}
+    if tokens is not None:
+        info["tokens"] = tokens
+    if cost is not None:
+        info["cost"] = cost
+    if summary is not None:
+        info["summary"] = summary
+    return {"type": "message.updated", "properties": {"info": info}}
+
+
+_TOKENS = {
+    "input": 100,
+    "output": 20,
+    "reasoning": 5,
+    "cache": {"read": 30, "write": 10},
+}
+
+
+def test_message_updated_emits_context_usage() -> None:
+    s = _state()
+    out = _drain(
+        translate_opencode_event(_msg_updated("m1", tokens=_TOKENS, cost=0.4), s)
+    )
+    usage = [e for e in out if isinstance(e, ContextUsagePacket)]
+    assert len(usage) == 1
+    assert usage[0].used_tokens == 165
+    assert usage[0].cost == 0.4
+
+
+def test_message_updated_no_usage_when_tokens_zero() -> None:
+    s = _state()
+    zero = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+    out = _drain(translate_opencode_event(_msg_updated("m1", tokens=zero), s))
+    assert not [e for e in out if isinstance(e, ContextUsagePacket)]
+
+
+def test_message_updated_no_usage_without_tokens() -> None:
+    s = _state()
+    out = _drain(translate_opencode_event(_msg_updated("m1"), s))
+    assert not [e for e in out if isinstance(e, ContextUsagePacket)]
+
+
+def test_summary_message_records_id_and_suppresses_usage() -> None:
+    s = _state()
+    out = _drain(
+        translate_opencode_event(_msg_updated("sum1", tokens=_TOKENS, summary=True), s)
+    )
+    assert "sum1" in s.summary_message_ids
+    assert not [e for e in out if isinstance(e, ContextUsagePacket)]
+
+
+def test_summary_message_text_delta_suppressed() -> None:
+    s = _state()
+    s.assistant_message_ids.add("sum1")
+    s.summary_message_ids.add("sum1")
+    delta = {
+        "type": "message.part.delta",
+        "properties": {
+            "field": "text",
+            "delta": "This is the summary",
+            "partID": "p1",
+            "messageID": "sum1",
+        },
+    }
+    assert _drain(translate_opencode_event(delta, s)) == []
+
+
+def test_session_compacted_emits_marker_with_summary() -> None:
+    s = _state()
+    s.summary_message_ids.add("sum1")
+    fetch, _ = _fetch_from(
+        {
+            "sum1": {
+                "info": {"role": "assistant"},
+                "parts": [{"type": "text", "text": "Recap"}],
+            }
+        }
+    )
+    out = _drain(
+        translate_opencode_event(
+            {"type": "session.compacted", "properties": {"sessionID": SESS}},
+            s,
+            fetch_message=fetch,
+        )
+    )
+    markers = [e for e in out if isinstance(e, CompactionPacket)]
+    assert len(markers) == 1
+    assert markers[0].summary == "Recap"

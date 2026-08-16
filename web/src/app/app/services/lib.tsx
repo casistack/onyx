@@ -4,6 +4,7 @@ import {
   StreamStopInfo,
 } from "@/lib/search/interfaces";
 import { handleSSEStream } from "@/lib/search/streamingUtils";
+import { ReasoningEffortOverride } from "@/lib/languageModels/types";
 import { FeedbackType } from "@/app/app/interfaces";
 import {
   BackendMessage,
@@ -55,6 +56,23 @@ export async function updateTemperatureOverrideForChatSession(
     body: JSON.stringify({
       chat_session_id: chatSessionId,
       temperature_override: newTemperature,
+    }),
+  });
+  return response;
+}
+
+export async function updateReasoningEffortForChatSession(
+  chatSessionId: string,
+  newReasoningEffort: ReasoningEffortOverride | null
+) {
+  const response = await fetch("/api/chat/update-chat-session-reasoning", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      chat_session_id: chatSessionId,
+      reasoning_effort_override: newReasoningEffort,
     }),
   });
   return response;
@@ -116,6 +134,7 @@ export interface LLMOverride {
   model_version: string;
   temperature?: number;
   display_name?: string;
+  model_configuration_id?: number | null;
 }
 
 export interface SendMessageParams {
@@ -132,6 +151,7 @@ export interface SendMessageParams {
   // LLM override parameters
   modelProvider?: string;
   modelVersion?: string;
+  modelConfigurationId?: number | null;
   temperature?: number;
   // Multi-model: send multiple LLM overrides for parallel generation
   llmOverrides?: LLMOverride[];
@@ -154,6 +174,7 @@ export async function* sendMessage({
   forcedToolId,
   modelProvider,
   modelVersion,
+  modelConfigurationId,
   temperature,
   llmOverrides,
   origin,
@@ -170,11 +191,12 @@ export async function* sendMessage({
     allowed_tool_ids: enabledToolIds,
     forced_tool_id: forcedToolId ?? null,
     llm_override:
-      temperature || modelVersion
+      temperature || modelVersion || modelConfigurationId != null
         ? {
             temperature,
             model_provider: modelProvider,
             model_version: modelVersion,
+            model_configuration_id: modelConfigurationId ?? null,
           }
         : null,
     // Multi-model: list of LLM overrides for parallel generation
@@ -194,6 +216,40 @@ export async function* sendMessage({
     body,
     signal,
   });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.detail ?? `HTTP error! status: ${response.status}`);
+  }
+
+  yield* withoutHeartbeats(handleSSEStream<PacketType>(response, signal));
+}
+
+// Drops keepalive heartbeats so stream consumers only ever see run state.
+async function* withoutHeartbeats(
+  stream: AsyncGenerator<PacketType, void, unknown>
+): AsyncGenerator<PacketType, void, unknown> {
+  for await (const packet of stream) {
+    if ("obj" in packet && packet.obj.type === "chat_heartbeat") {
+      continue;
+    }
+    yield packet;
+  }
+}
+
+// Replays an in-flight run's buffered stream from `cursor`, then tails it live.
+// 404 means there is nothing to resume — callers fall back to the persisted
+// session state. Heartbeats pass through: the consumer uses them as liveness
+// ticks to re-check session focus during quiet phases.
+export async function* resumeStream(
+  chatSessionId: string,
+  cursor: number,
+  signal?: AbortSignal
+): AsyncGenerator<PacketType, void, unknown> {
+  const response = await fetch(
+    `/api/chat/chat-session/${chatSessionId}/resume-stream?cursor=${cursor}`,
+    { signal }
+  );
 
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
@@ -316,10 +372,15 @@ export async function deleteAllChatSessions() {
 }
 
 export async function getAvailableContextTokens(
-  chatSessionId: string
+  chatSessionId: string,
+  modelConfigurationId?: number | null
 ): Promise<number | null> {
+  const params =
+    modelConfigurationId != null
+      ? `?model_configuration_id=${modelConfigurationId}`
+      : "";
   const response = await fetch(
-    `/api/chat/available-context-tokens/${chatSessionId}`
+    `/api/chat/available-context-tokens/${chatSessionId}${params}`
   );
   if (!response.ok) {
     return null;

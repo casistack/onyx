@@ -6,33 +6,26 @@ wakes the parked proxy via the `approval:wake:{id}` channel; a missed
 wake just falls back to the proxy's wait timeout.
 """
 
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
-from typing import Any
-from typing import Literal
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter
-from fastapi import Depends
-from pydantic import BaseModel
-from pydantic import computed_field
-from pydantic import ConfigDict
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, ConfigDict, computed_field
 from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.cache.factory import get_cache_backend
-from onyx.cache.interface import CACHE_TRANSIENT_ERRORS
+from onyx.cache.interface import CACHE_TRANSIENT_ERRORS, CacheBackend
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import ApprovalDecidedVia
-from onyx.db.enums import ApprovalDecision
-from onyx.db.enums import Permission
-from onyx.db.models import User
+from onyx.db.enums import ApprovalDecidedVia, ApprovalDecision, GatedAppKind, Permission
+from onyx.db.models import ActionApproval, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
-from onyx.external_apps.matching.engine import MatchedAction
+from onyx.external_apps.matching.engine import MatchedAction, actions_requiring_approval
 from onyx.external_apps.presentation.decode import decode_payload
 from onyx.sandbox_proxy import approval_cache
+from onyx.server.features.build.configs import SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS
 from onyx.server.features.build.db import action_approval
 from onyx.server.features.build.db.build_session import get_build_session
 from onyx.utils.logger import setup_logger
@@ -77,13 +70,31 @@ class ApprovalView(BaseModel):
         if self.decision is not None:
             return False
         cutoff = datetime.now(timezone.utc) - timedelta(
-            seconds=approval_cache.WAIT_TIMEOUT_S
+            seconds=SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS
         )
         return self.created_at >= cutoff
 
 
 class ApprovalListResponse(BaseModel):
     items: list[ApprovalView]
+
+
+def _row_target(row: ActionApproval) -> tuple[GatedAppKind, int] | None:
+    """The gated target ``(kind, id)`` a row is attributed to, or ``None`` when
+    its ``gated_app`` was cleared (parent app/server deleted — SET NULL)."""
+    return row.gated_app.target_key if row.gated_app is not None else None
+
+
+def _send_wake_best_effort(approval_id: UUID, decision: ApprovalDecision) -> None:
+    try:
+        cache = get_cache_backend(tenant_id=get_current_tenant_id())
+        approval_cache.send_wake(approval_id, decision, cache)
+    except CACHE_TRANSIENT_ERRORS as e:
+        logger.warning(
+            "approval.wake_failed approval_id=%s error=%s",
+            approval_id,
+            str(e),
+        )
 
 
 def _existing_decision_response(
@@ -120,38 +131,13 @@ def list_live_approvals(
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "session not found")
 
     cutoff = datetime.now(timezone.utc) - timedelta(
-        seconds=approval_cache.WAIT_TIMEOUT_S
+        seconds=SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS
     )
     pending_rows = action_approval.list_session_pending_action_approvals(
         db_session, session_id, created_after=cutoff
     )
     return ApprovalListResponse(
         items=[ApprovalView.model_validate(row) for row in pending_rows]
-    )
-
-
-@router.get("/sessions/{session_id}")
-def list_session_approvals(
-    session_id: UUID,
-    decision: ApprovalDecision | None = None,
-    since: datetime | None = None,
-    until: datetime | None = None,
-    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
-    db_session: Session = Depends(get_session),
-) -> ApprovalListResponse:
-    """Audit query for a session. Non-owners get NOT_FOUND (no existence leak)."""
-    if get_build_session(session_id, user.id, db_session) is None:
-        raise OnyxError(OnyxErrorCode.NOT_FOUND, "session not found")
-
-    rows = action_approval.list_session_action_approvals(
-        db_session,
-        session_id,
-        decision=decision,
-        since=since,
-        until=until,
-    )
-    return ApprovalListResponse(
-        items=[ApprovalView.model_validate(row) for row in rows]
     )
 
 
@@ -207,14 +193,142 @@ def submit_decision(
         body.decision.value,
     )
 
-    try:
-        cache = get_cache_backend(tenant_id=get_current_tenant_id())
-        approval_cache.send_wake(approval_id, body.decision, cache)
-    except CACHE_TRANSIENT_ERRORS as e:
-        logger.warning(
-            "approval.wake_failed approval_id=%s error=%s",
-            approval_id,
-            str(e),
-        )
+    _send_wake_best_effort(approval_id, body.decision)
 
     return ApprovalView.model_validate(decided)
+
+
+@router.post("/{approval_id}/session-grant")
+def submit_session_grant(
+    approval_id: UUID,
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> ApprovalView:
+    """Approve this request and similar app/action requests for the session."""
+    current = action_approval.get_action_approval_for_user(
+        db_session, approval_id, user.id
+    )
+    if current is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "approval request not found")
+    session_id = current.session_id
+    target = _row_target(current)
+    if target is None:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "approval request cannot be granted for a session",
+        )
+    target_kind, target_id = target
+    if current.decision is not None:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "approval request already resolved",
+        )
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=SANDBOX_APPROVAL_WAIT_TIMEOUT_SECONDS
+    )
+    if current.created_at < cutoff:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            "approval request is no longer live",
+        )
+
+    grant_action_types = actions_requiring_approval(current.actions)
+    if not grant_action_types:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            "approval request has no grantable actions",
+        )
+
+    approved_ids: list[UUID] = []
+    decided_current = action_approval.try_record_decision(
+        db_session,
+        approval_id=approval_id,
+        decision=ApprovalDecision.APPROVED,
+        decided_via=ApprovalDecidedVia.SESSION_GRANT,
+    )
+    if decided_current is None:
+        db_session.expire(current)
+        winner = action_approval.get_action_approval(db_session, approval_id)
+        if winner is None:
+            raise OnyxError(OnyxErrorCode.NOT_FOUND, "approval request not found")
+        if winner.decision is None:
+            raise OnyxError(
+                OnyxErrorCode.INTERNAL_ERROR,
+                "approval row reverted to pending unexpectedly",
+            )
+        existing = winner.decision.value
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT,
+            f"approval request already resolved ({existing})",
+        )
+    approved_ids.append(approval_id)
+
+    db_session.commit()
+    _send_wake_best_effort(approval_id, ApprovalDecision.APPROVED)
+
+    grant_source_rows = action_approval.list_session_grant_action_approvals(
+        db_session,
+        session_id=session_id,
+        gated_app_id=current.gated_app_id,
+    )
+    cache: CacheBackend | None = None
+    try:
+        cache = get_cache_backend(tenant_id=get_current_tenant_id())
+    except CACHE_TRANSIENT_ERRORS as e:
+        logger.warning(
+            "approval.session_grant_cache_failed approval_id=%s session_id=%s error=%s",
+            approval_id,
+            session_id,
+            str(e),
+        )
+    granted_action_types = approval_cache.hydrate_session_grants(
+        session_id=session_id,
+        kind=target_kind,
+        target_id=target_id,
+        rows=grant_source_rows,
+        cache=cache,
+    )
+
+    pending_rows = action_approval.list_session_pending_action_approvals(
+        db_session, session_id, created_after=cutoff, load_target=True
+    )
+    for row in pending_rows:
+        if row.approval_id == approval_id:
+            continue
+        if _row_target(row) != target:
+            continue
+        row_action_types = set(actions_requiring_approval(row.actions))
+        covered = bool(row_action_types) and row_action_types.issubset(
+            granted_action_types
+        )
+        if not covered:
+            continue
+        decided = action_approval.try_record_decision(
+            db_session,
+            approval_id=row.approval_id,
+            decision=ApprovalDecision.APPROVED,
+            decided_via=ApprovalDecidedVia.SESSION_GRANT,
+        )
+        if decided is not None:
+            approved_ids.append(row.approval_id)
+
+    db_session.commit()
+
+    for approved_id in approved_ids:
+        if approved_id == approval_id:
+            continue
+        _send_wake_best_effort(approved_id, ApprovalDecision.APPROVED)
+
+    logger.info(
+        "approval.session_grant_recorded approval_id=%s session_id=%s "
+        "user_id=%s target=%s:%s action_types=%s approved_count=%s",
+        approval_id,
+        session_id,
+        user.id,
+        target_kind.value,
+        target_id,
+        grant_action_types,
+        len(approved_ids),
+    )
+
+    return ApprovalView.model_validate(decided_current)

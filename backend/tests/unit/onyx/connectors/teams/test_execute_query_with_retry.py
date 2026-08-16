@@ -7,15 +7,16 @@ gateway/server hiccups). A live daily-connector test cannot reliably induce a
 """
 
 from typing import Any
-from unittest.mock import MagicMock
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from office365.runtime.client_request_exception import ClientRequestException
 
-from onyx.connectors.teams.utils import _backoff_seconds
-from onyx.connectors.teams.utils import execute_query_with_retry
-from onyx.connectors.teams.utils import GRAPH_API_RETRYABLE_STATUSES
+from onyx.connectors.teams.utils import (
+    GRAPH_API_RETRYABLE_STATUSES,
+    _backoff_seconds,
+    execute_query_with_retry,
+)
 
 
 def _client_request_exception(
@@ -121,7 +122,13 @@ def test_backoff_falls_back_to_capped_jittered_exponential() -> None:
         assert base / 2 <= delay <= base
 
 
-def test_backoff_ignores_non_numeric_retry_after() -> None:
-    # HTTP-date Retry-After values fall through to jittered exponential backoff.
-    delay = _backoff_seconds(attempt=0, retry_after="Wed, 21 Oct 2026 07:28:00 GMT")
+def test_backoff_honors_http_date_retry_after() -> None:
+    # An already-elapsed HTTP-date Retry-After is honored verbatim (0s wait),
+    # not treated as unparseable.
+    assert _backoff_seconds(attempt=0, retry_after="Wed, 21 Oct 2015 07:28:00 GMT") == 0
+
+
+def test_backoff_ignores_unparseable_retry_after() -> None:
+    # Genuinely unparseable values fall through to jittered exponential backoff.
+    delay = _backoff_seconds(attempt=0, retry_after="not-a-date")
     assert 2.5 <= delay <= 5

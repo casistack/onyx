@@ -16,23 +16,34 @@ import {
   ThemePreference,
 } from "@/lib/types";
 import { usePostHog } from "posthog-js/react";
+import { isAuthStatusError } from "@/lib/fetcher";
 import { useSettings } from "@/lib/settings/hooks";
-import { useTokenRefresh } from "@/hooks/useTokenRefresh";
-import { useCurrentUser } from "@/hooks/useCurrentUser";
+import { useCurrentUser } from "@/lib/users/hooks";
+import { useAuthTypeMetadata, useTokenRefresh } from "@/lib/auth/hooks";
+import { AuthTypeMetadata } from "@/lib/auth/types";
 import {
-  useAuthTypeMetadata,
-  AuthTypeMetadata,
-} from "@/hooks/useAuthTypeMetadata";
-import { updateUserPersonalization as persistPersonalization } from "@/lib/userSettings";
+  updateUserPersonalization as persistPersonalization,
+  setUserDefaultModel,
+} from "@/lib/users/svc";
 import { useTheme } from "next-themes";
+
+// Auth failures skip SWR's retry but are usually transient refresh races. SWR's backoff owns the rest.
+const ME_RETRY_DELAYS_MS = [2_000, 5_000, 15_000];
+
+// Ceiling on reporting loading for a failing /api/me, so the account menu always comes back.
+const ME_LOADING_DEADLINE_MS = 30_000;
+
+/** Only "resolved" lets a null user mean signed out. "unavailable" means /api/me keeps failing for a possibly valid session. */
+export type UserResolution = "loading" | "unavailable" | "resolved";
 
 interface UserContextType {
   user: User | null;
+  userResolution: UserResolution;
   isAdmin: boolean;
   isCurator: boolean;
   refreshUser: () => Promise<void>;
   isCloudSuperuser: boolean;
-  authTypeMetadata: AuthTypeMetadata;
+  authTypeMetadata: AuthTypeMetadata | undefined;
   updateUserAutoScroll: (autoScroll: boolean) => Promise<void>;
   updateUserShortcuts: (enabled: boolean) => Promise<void>;
   updateUserPasteAsTile: (enabled: boolean) => Promise<void>;
@@ -61,7 +72,7 @@ interface UserContextType {
 const UserContext = createContext<UserContextType | undefined>(undefined);
 
 export function UserProvider({ children }: { children: React.ReactNode }) {
-  const { user: fetchedUser, mutateUser } = useCurrentUser();
+  const { user: fetchedUser, mutateUser, userError } = useCurrentUser();
   const { authTypeMetadata, isLoading: authTypeMetadataLoading } =
     useAuthTypeMetadata();
   const updatedSettingsData = useSettings();
@@ -86,7 +97,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
           temperature_override_enabled:
             currentUser.preferences?.temperature_override_enabled ??
             wsTemperatureOverride ??
-            false,
+            true,
         },
       };
     },
@@ -98,6 +109,55 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setUpToDateUser(mergeUserPreferences(fetchedUser ?? null));
   }, [fetchedUser, mergeUserPreferences]);
+
+  const [meRetriesExhausted, setMeRetriesExhausted] = useState(false);
+
+  const meRetryCountRef = useRef(0);
+  const meFirstErrorAtRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!userError) {
+      meRetryCountRef.current = 0;
+      meFirstErrorAtRef.current = null;
+      setMeRetriesExhausted(false);
+      return;
+    }
+    meFirstErrorAtRef.current ??= Date.now();
+    if (!isAuthStatusError(userError)) {
+      // SWR's backoff owns non-auth retries. Bound only how long we report loading.
+      const remaining =
+        ME_LOADING_DEADLINE_MS - (Date.now() - meFirstErrorAtRef.current);
+      if (remaining <= 0) {
+        setMeRetriesExhausted(true);
+        return;
+      }
+      const deadlineId = setTimeout(
+        () => setMeRetriesExhausted(true),
+        remaining
+      );
+      return () => clearTimeout(deadlineId);
+    }
+    // Fresh error identity per failure advances the schedule. The count moves in the timer, so StrictMode is safe.
+    const attempt = meRetryCountRef.current;
+    const delay = ME_RETRY_DELAYS_MS[attempt];
+    if (delay === undefined) {
+      setMeRetriesExhausted(true);
+      return;
+    }
+    const timeoutId = setTimeout(() => {
+      meRetryCountRef.current = attempt + 1;
+      void mutateUser();
+    }, delay);
+    return () => clearTimeout(timeoutId);
+  }, [userError, mutateUser]);
+
+  const awaitingMe = fetchedUser === undefined && !meRetriesExhausted;
+  const mergePending = fetchedUser != null && upToDateUser === null;
+  const userResolution: UserResolution =
+    awaitingMe || mergePending
+      ? "loading"
+      : fetchedUser === undefined
+        ? "unavailable"
+        : "resolved";
 
   useEffect(() => {
     if (!posthog) return;
@@ -120,12 +180,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   const onRefreshFail = useCallback(async () => {
     await mutateUser();
   }, [mutateUser]);
-  useTokenRefresh(
-    upToDateUser,
-    authTypeMetadata,
-    authTypeMetadataLoading,
-    onRefreshFail
-  );
+  useTokenRefresh(upToDateUser, authTypeMetadataLoading, onRefreshFail);
 
   // Sync user's theme preference from DB to next-themes on load
   const { setTheme, theme } = useTheme();
@@ -447,13 +502,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
         return prevUser;
       });
 
-      const response = await fetch(`/api/user/default-model`, {
-        method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ default_model: defaultModel }),
-      });
+      const response = await setUserDefaultModel(defaultModel);
 
       if (!response.ok) {
         await refreshUser();
@@ -550,6 +599,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     <UserContext.Provider
       value={{
         user: upToDateUser,
+        userResolution,
         refreshUser,
         authTypeMetadata,
         updateUserAutoScroll,

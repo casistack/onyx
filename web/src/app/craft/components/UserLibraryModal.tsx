@@ -11,7 +11,7 @@ import {
   deleteLibraryFile,
 } from "@/app/craft/services/apiServices";
 import { LibraryEntry } from "@/app/craft/types/user-library";
-import Modal from "@/refresh-components/Modal";
+import { Modal } from "@opal/components";
 import { cn } from "@opal/utils";
 import {
   SvgFolder,
@@ -546,7 +546,7 @@ function LibraryTreeView({
               )}
 
               {/* Row actions — revealed on hover/focus */}
-              <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+              <div className="flex items-center gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 no-hover:opacity-100">
                 {entry.is_directory && (
                   <Button
                     prominence="tertiary"

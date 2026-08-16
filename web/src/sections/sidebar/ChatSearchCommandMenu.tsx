@@ -6,15 +6,15 @@ import type { Route } from "next";
 import CommandMenu, {
   useCommandMenuContext,
 } from "@/refresh-components/commandmenu/CommandMenu";
-import { useProjects } from "@/lib/hooks/useProjects";
-import { useCreateModal } from "@/refresh-components/contexts/ModalContext";
+import { useProjects } from "@/lib/projects/hooks";
+import { useCreateModal } from "@opal/components";
 import CreateProjectModal from "@/sections/modals/CreateProjectModal";
 import { timeAgo } from "@opal/time";
-import { highlightMatch } from "@/sections/sidebar/chatSearchUtils";
+import { highlightMatch } from "@/lib/sidebar/utils";
 import { useSettings } from "@/lib/settings/hooks";
 import { useCurrentAgent } from "@/lib/agents/hooks";
 import Text from "@/refresh-components/texts/Text";
-import { useChatSearchOptimistic } from "./useChatSearchOptimistic";
+import useChatSearchOptimistic from "@/lib/sidebar/hooks";
 import {
   SvgEditBig,
   SvgFolder,
@@ -264,7 +264,11 @@ export default function ChatSearchCommandMenu({
                             ↵
                           </Text>
                         ) : (
-                          <Text secondaryBody text03>
+                          <Text
+                            secondaryBody
+                            text03
+                            data-testid="command-menu-timestamp"
+                          >
                             {timeAgo(chat.time)}
                           </Text>
                         )
@@ -321,7 +325,11 @@ export default function ChatSearchCommandMenu({
                           ↵
                         </Text>
                       ) : (
-                        <Text secondaryBody text03>
+                        <Text
+                          secondaryBody
+                          text03
+                          data-testid="command-menu-timestamp"
+                        >
                           {timeAgo(project.time)}
                         </Text>
                       )

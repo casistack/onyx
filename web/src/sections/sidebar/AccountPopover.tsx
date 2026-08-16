@@ -9,7 +9,7 @@ import {
   getUserDisplayName,
   getUserEmail,
   logout,
-} from "@/lib/user";
+} from "@/lib/users/svc";
 import { useUser } from "@/providers/UserProvider";
 import { Popover, PopoverMenu } from "@opal/components";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -24,27 +24,29 @@ import {
   SvgUser,
   SvgNotificationBubble,
 } from "@opal/icons";
-import { Content } from "@opal/layouts";
+import { Content, toast } from "@opal/layouts";
 import { Section } from "@/layouts/general-layouts";
-import { toast } from "@/hooks/useToast";
 import useAppFocus from "@/hooks/useAppFocus";
+import useScreenSize from "@/hooks/useScreenSize";
 import { useSettings } from "@/lib/settings/hooks";
 import UserAvatar from "@/refresh-components/avatars/UserAvatar";
-import useNotifications from "@/hooks/useNotifications";
+import SidebarTabSkeleton from "@/refresh-components/skeletons/SidebarTabSkeleton";
+import { useNotificationSummary } from "@/hooks/useNotifications";
 import { SvgOnyxLogo } from "@opal/logos";
 import { markdown } from "@opal/utils";
 
 interface SettingsPopoverProps {
   onUserSettingsClick: () => void;
   onOpenNotifications: () => void;
+  undismissedCount: number;
 }
 
 function SettingsPopover({
   onUserSettingsClick,
   onOpenNotifications,
+  undismissedCount,
 }: SettingsPopoverProps) {
-  const { user } = useUser();
-  const { undismissedCount } = useNotifications();
+  const { user, userResolution } = useUser();
   const settings = useSettings();
   const enterpriseSettings = settings.enterprise;
   const router = useRouter();
@@ -77,9 +79,7 @@ function SettingsPopover({
 
         const encodedRedirect = encodeURIComponent(currentUrl);
 
-        router.push(
-          `/auth/login?disableAutoRedirect=true&next=${encodedRedirect}`
-        );
+        router.push(`/auth/login?next=${encodedRedirect}`);
       })
 
       .catch(() => {
@@ -91,7 +91,14 @@ function SettingsPopover({
     <PopoverMenu>
       {[
         <div key="user-email" className="p-2">
-          <Content sizePreset="main-ui" title={getUserEmail(user)} />
+          <Content
+            sizePreset="main-ui"
+            title={
+              userResolution === "unavailable"
+                ? "Profile unavailable"
+                : getUserEmail(user)
+            }
+          />
         </div>,
         null,
         <div key="user-settings" data-testid="Settings/user-settings">
@@ -199,11 +206,14 @@ export default function AccountPopover({
   const [popupState, setPopupState] = useState<
     "Settings" | "Notifications" | undefined
   >(undefined);
-  const { user } = useUser();
+  const { user, userResolution } = useUser();
   const appFocus = useAppFocus();
+  const { isMobile } = useScreenSize();
   const { vectorDbEnabled } = useSettings();
-  const { undismissedCount } = useNotifications();
-  const userDisplayName = getUserDisplayName(user);
+  const { undismissedCount, refresh: refreshNotificationSummary } =
+    useNotificationSummary();
+  const userDisplayName =
+    userResolution === "unavailable" ? "Account" : getUserDisplayName(user);
 
   const handlePopoverOpen = (state: boolean) => {
     if (state) {
@@ -214,11 +224,15 @@ export default function AccountPopover({
         preload("/api/manage/connector-status", errorHandlingFetcher);
       }
       preload("/api/llm/provider", errorHandlingFetcher);
+      void refreshNotificationSummary();
       setPopupState("Settings");
     } else {
       setPopupState(undefined);
     }
   };
+  if (userResolution === "loading") {
+    return <SidebarTabSkeleton folded={folded} />;
+  }
 
   return (
     <Popover open={!!popupState} onOpenChange={handlePopoverOpen}>
@@ -247,8 +261,8 @@ export default function AccountPopover({
       </Popover.Trigger>
 
       <Popover.Content
-        align="end"
-        side="right"
+        align={isMobile ? "start" : "end"}
+        side={isMobile ? "top" : "right"}
         width={popupState === "Notifications" ? "2xl" : "lg"}
       >
         {popupState === "Settings" && (
@@ -257,6 +271,7 @@ export default function AccountPopover({
               setPopupState(undefined);
             }}
             onOpenNotifications={() => setPopupState("Notifications")}
+            undismissedCount={undismissedCount}
           />
         )}
         {popupState === "Notifications" && (

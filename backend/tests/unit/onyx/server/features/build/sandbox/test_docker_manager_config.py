@@ -9,62 +9,59 @@ env allowlist), so we lock it down here.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
+import yaml
 
 import onyx.server.features.build.sandbox.docker.docker_sandbox_manager as dsm
 from onyx.server.features.build.configs import SANDBOX_PROXY_INJECTED_PLACEHOLDER
 from onyx.server.features.build.sandbox.docker.dev_mode_serve import (
     OPENCODE_SERVE_CONTAINER_PORT,
-)
-from onyx.server.features.build.sandbox.docker.dev_mode_serve import (
     OPENCODE_SERVE_HOST_BIND_IP,
 )
 from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
+    LABEL_COMPONENT,
+    LABEL_COMPONENT_VALUE,
+    LABEL_SANDBOX_ID,
+    LABEL_TENANT_ID,
+    LABEL_USER_ID,
+    SANDBOX_TMP_PATH,
+    SANDBOX_TMPFS_OPTIONS,
+    ContainerCreateKwargs,
     _sandbox_container_name,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
     _sandbox_volume_name,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
     _sanitize_relative_path,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
     _validate_strict_path,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
     build_container_create_kwargs,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
     build_sandbox_labels,
 )
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    ContainerCreateKwargs,
+from onyx.server.features.build.sandbox.labels import (
+    LABEL_K8S_MANAGED_BY,
+    LABEL_K8S_MANAGED_BY_ONYX,
 )
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    LABEL_COMPONENT,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    LABEL_COMPONENT_VALUE,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    LABEL_SANDBOX_ID,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    LABEL_TENANT_ID,
-)
-from onyx.server.features.build.sandbox.docker.docker_sandbox_manager import (
-    LABEL_USER_ID,
-)
-from onyx.server.features.build.sandbox.labels import LABEL_K8S_MANAGED_BY
-from onyx.server.features.build.sandbox.labels import LABEL_K8S_MANAGED_BY_ONYX
 
 SANDBOX_ID = UUID("12345678-1234-1234-1234-1234567890ab")
 USER_ID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 TENANT_ID = "tenant-abc"
+REPO_ROOT = next(
+    parent for parent in Path(__file__).parents if (parent / "deployment").is_dir()
+)
+
+
+def _bare_manager_with_image(image: str) -> tuple[dsm.DockerSandboxManager, MagicMock]:
+    mgr: dsm.DockerSandboxManager = object.__new__(dsm.DockerSandboxManager)
+    docker = MagicMock()
+    mgr._docker = docker  # type: ignore[attr-defined]
+    mgr._image = image  # type: ignore[attr-defined]
+    mgr._image_checked = False  # type: ignore[attr-defined]
+    mgr._image_check_lock = threading.Lock()  # type: ignore[attr-defined]
+    return mgr, docker
 
 
 def test_container_name_matches_k8s_pattern() -> None:
@@ -103,6 +100,117 @@ def test_labels_omit_user_id_when_none() -> None:
     labels = build_sandbox_labels(SANDBOX_ID, TENANT_ID, None)
     assert LABEL_USER_ID not in labels
     assert labels[LABEL_SANDBOX_ID] == str(SANDBOX_ID)
+
+
+def test_immutable_sandbox_image_uses_cached_image_when_present() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:v4.1.2")
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.get.assert_called_once_with("onyxdotapp/sandbox:v4.1.2")
+    docker.images.pull.assert_not_called()
+
+
+def test_immutable_sandbox_image_pulls_when_missing() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:v4.1.2")
+    docker.images.get.side_effect = dsm.NotFound("missing")
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.pull.assert_called_once_with("onyxdotapp/sandbox:v4.1.2")
+
+
+def test_mutable_sandbox_image_refreshes_once() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:latest")
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.pull.assert_called_once_with("onyxdotapp/sandbox:latest")
+    docker.images.get.assert_not_called()
+
+
+def test_sandbox_image_refresh_is_thread_safe() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:latest")
+    pull_started = threading.Event()
+    finish_pull = threading.Event()
+
+    def pull_image(_image: str) -> None:
+        pull_started.set()
+        assert finish_pull.wait(timeout=1)
+
+    docker.images.pull.side_effect = pull_image
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(mgr._ensure_sandbox_image)  # type: ignore[attr-defined]
+        assert pull_started.wait(timeout=1)
+        second = executor.submit(mgr._ensure_sandbox_image)  # type: ignore[attr-defined]
+        finish_pull.set()
+        first.result(timeout=1)
+        second.result(timeout=1)
+
+    docker.images.pull.assert_called_once_with("onyxdotapp/sandbox:latest")
+
+
+def test_implicit_latest_sandbox_image_refreshes() -> None:
+    image = "onyxdotapp/sandbox"
+    mgr, docker = _bare_manager_with_image(image)
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.pull.assert_called_once_with(image)
+    docker.images.get.assert_not_called()
+
+
+def test_mutable_sandbox_image_uses_cache_once_if_refresh_fails() -> None:
+    # Avoid retrying the registry on every sandbox spinup. A process restart
+    # gets another chance to refresh the moving tag.
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:edge")
+    docker.images.pull.side_effect = dsm.APIError("registry unavailable")
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.pull.assert_called_once_with("onyxdotapp/sandbox:edge")
+    docker.images.get.assert_called_once_with("onyxdotapp/sandbox:edge")
+
+
+def test_mutable_sandbox_image_raises_if_refresh_fails_without_cache() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:beta")
+    docker.images.pull.side_effect = dsm.APIError("registry unavailable")
+    docker.images.get.side_effect = dsm.NotFound("missing")
+
+    with pytest.raises(RuntimeError, match="Failed to pull sandbox image"):
+        mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+
+def test_local_dev_sandbox_image_uses_cached_image_when_present() -> None:
+    mgr, docker = _bare_manager_with_image("onyxdotapp/sandbox:dev")
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.get.assert_called_once_with("onyxdotapp/sandbox:dev")
+    docker.images.pull.assert_not_called()
+
+
+def test_registry_port_untagged_image_refreshes_as_implicit_latest() -> None:
+    image = "localhost:5001/onyx-sandbox"
+    mgr, docker = _bare_manager_with_image(image)
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.pull.assert_called_once_with(image)
+    docker.images.get.assert_not_called()
+
+
+def test_digest_sandbox_image_uses_cached_image_when_present() -> None:
+    image = "onyxdotapp/sandbox@sha256:abc123"
+    mgr, docker = _bare_manager_with_image(image)
+
+    mgr._ensure_sandbox_image()  # type: ignore[attr-defined]
+
+    docker.images.get.assert_called_once_with(image)
+    docker.images.pull.assert_not_called()
 
 
 _OPENCODE_PASSWORD = "secret-password-fixture"
@@ -147,7 +255,7 @@ def proxy_kwargs() -> ContainerCreateKwargs:
         tenant_id=TENANT_ID,
         image="onyxdotapp/sandbox:test",
         onyx_pat=SANDBOX_PROXY_INJECTED_PLACEHOLDER,
-        api_server_url="https://onyx.example.com",
+        api_server_url="https://onyx.example.com/api",
         network="onyx_craft_sandbox",
         volume_name="onyx-craft-sandbox-12345678",
         memory_limit="2g",
@@ -155,7 +263,6 @@ def proxy_kwargs() -> ContainerCreateKwargs:
         opencode_password=_OPENCODE_PASSWORD,
         opencode_config_json=_OPENCODE_CONFIG_JSON,
         sandbox_proxy_host="sandbox-proxy",
-        sandbox_proxy_port=8080,
         proxy_ca_volume_name="sandbox_proxy_ca",
     )
 
@@ -257,6 +364,7 @@ def test_container_kwargs_env_allowlist_excludes_storage_credentials(
     # Required env
     assert env["ONYX_PAT"] == "pat-redacted"
     assert env["ONYX_SERVER_URL"] == "http://api_server:8080"
+    assert env["ONYX_API_PREFIX"] == ""
     # opencode-serve transport wiring
     assert env["OPENCODE_SERVER_PASSWORD"] == _OPENCODE_PASSWORD
     assert env["OPENCODE_CONFIG_CONTENT"] == _OPENCODE_CONFIG_JSON
@@ -391,6 +499,7 @@ def test_container_kwargs_env_is_a_minimal_allowlist(
     assert set(env.keys()) == {
         "ONYX_PAT",
         "ONYX_SERVER_URL",
+        "ONYX_API_PREFIX",
         "OPENCODE_SERVER_PASSWORD",
         "OPENCODE_CONFIG_CONTENT",
     }
@@ -414,10 +523,17 @@ def test_container_kwargs_mounts_only_workspace_sessions(
         )
 
 
+def test_container_kwargs_mounts_tmp_as_tmpfs(
+    kwargs: ContainerCreateKwargs,
+) -> None:
+    """Expose /tmp as sandbox-local scratch space without adding a host mount."""
+    assert kwargs["tmpfs"] == {SANDBOX_TMP_PATH: SANDBOX_TMPFS_OPTIONS}
+
+
 def test_container_kwargs_warns_on_internal_compose_host(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Deployers that point SANDBOX_API_SERVER_URL at compose DNS get warned."""
+    """Deployers that point ONYX_SERVER_URL at compose DNS get warned."""
     import logging
 
     with caplog.at_level(logging.WARNING):
@@ -454,7 +570,7 @@ def test_container_kwargs_no_warning_for_public_url(
             tenant_id=TENANT_ID,
             image="onyxdotapp/sandbox:test",
             onyx_pat="pat",
-            api_server_url="https://onyx.example.com",
+            api_server_url="https://onyx.example.com/api",
             network="onyx_craft_sandbox",
             volume_name="vol",
             memory_limit="2g",
@@ -465,6 +581,32 @@ def test_container_kwargs_no_warning_for_public_url(
     assert not any(
         "looks like an internal compose hostname" in r.getMessage()
         for r in caplog.records
+    )
+
+
+def test_container_kwargs_no_warning_for_craft_api_alias(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        build_container_create_kwargs(
+            sandbox_id=SANDBOX_ID,
+            user_id=USER_ID,
+            tenant_id=TENANT_ID,
+            image="onyxdotapp/sandbox:test",
+            onyx_pat="pat",
+            api_server_url="http://onyx-craft-api:8080",
+            network="onyx_craft_sandbox",
+            volume_name="vol",
+            memory_limit="2g",
+            cpu_limit=1.0,
+            opencode_password=_OPENCODE_PASSWORD,
+            opencode_config_json=_OPENCODE_CONFIG_JSON,
+        )
+    assert not any(
+        "looks like an internal compose hostname" in record.getMessage()
+        for record in caplog.records
     )
 
 
@@ -544,13 +686,14 @@ def test_proxy_kwargs_env_contains_proxy_and_ca_keys(
 ) -> None:
     """
     Env must wire HTTPS_PROXY + the SDK CA envs + firewall-init.sh's own
-    contract vars (bootstrap mode + CA paths).
+    contract vars.
     """
     env = proxy_kwargs["environment"]
-    # The legacy 4-key core is preserved; ONYX_PAT is the proxy placeholder in
-    # this posture (real value lives in Postgres, proxy injects on wire).
+    # The compatibility core is preserved; ONYX_PAT is the proxy placeholder
+    # in this posture (real value lives in Postgres, proxy injects on wire).
     assert env["ONYX_PAT"] == SANDBOX_PROXY_INJECTED_PLACEHOLDER
-    assert env["ONYX_SERVER_URL"] == "https://onyx.example.com"
+    assert env["ONYX_SERVER_URL"] == "https://onyx.example.com/api"
+    assert env["ONYX_API_PREFIX"] == ""
     assert env["OPENCODE_SERVER_PASSWORD"] == _OPENCODE_PASSWORD
     assert env["OPENCODE_CONFIG_CONTENT"] == _OPENCODE_CONFIG_JSON
     # firewall-init.sh contract.
@@ -620,6 +763,7 @@ def test_proxy_kwargs_env_is_a_locked_allowlist(
         # Legacy core
         "ONYX_PAT",
         "ONYX_SERVER_URL",
+        "ONYX_API_PREFIX",
         "OPENCODE_SERVER_PASSWORD",
         "OPENCODE_CONFIG_CONTENT",
         # firewall-init.sh contract
@@ -646,6 +790,28 @@ def test_proxy_kwargs_env_is_a_locked_allowlist(
     }
 
 
+def test_compose_uses_internal_api_alias_for_craft() -> None:
+    compose_path = REPO_ROOT / "deployment/docker_compose/docker-compose.craft.yml"
+    compose = yaml.safe_load(compose_path.read_text())
+    services = compose["services"]
+
+    api_network = services["api_server"]["networks"]["onyx_craft_sandbox"]
+    assert api_network["aliases"] == ["onyx-craft-api"]
+
+    expected_url = "ONYX_SERVER_URL=${ONYX_SERVER_URL:-http://onyx-craft-api:8080}"
+    for service_name in ("api_server", "background"):
+        environment = services[service_name]["environment"]
+        assert expected_url in environment
+        assert "SANDBOX_PROXY_HOST=${SANDBOX_PROXY_HOST-sandbox-proxy}" in environment
+
+    proxy_environment = services["sandbox-proxy"]["environment"]
+    assert expected_url in proxy_environment
+    assert "onyx_craft_sandbox" in services["sandbox-proxy"]["networks"]
+    assert services["api_server"]["depends_on"]["sandbox-proxy"]["condition"] == (
+        "service_healthy"
+    )
+
+
 def test_no_proxy_kwargs_omit_cap_add(kwargs: ContainerCreateKwargs) -> None:
     """
     The no-proxy posture must NOT carry cap_add; NET_ADMIN out of nowhere would
@@ -659,29 +825,16 @@ def test_no_proxy_kwargs_keep_legacy_command(kwargs: ContainerCreateKwargs) -> N
     assert kwargs["command"] == ["/workspace/entrypoint.sh"]
 
 
-@pytest.mark.parametrize(
-    "port, ca_volume",
-    [
-        (None, "sandbox_proxy_ca"),
-        (8080, None),
-    ],
-)
-def test_proxy_kwargs_requires_port_and_ca_volume(
-    port: int | None, ca_volume: str | None
-) -> None:
-    """
-    All-or-nothing: setting the proxy host without BOTH port and CA volume is a
-    misconfiguration and must raise loudly. Cover each missing piece separately
-    so a short-circuiting guard can't pass.
-    """
-    with pytest.raises(ValueError, match="Proxy posture requires all three"):
+def test_proxy_kwargs_requires_ca_volume() -> None:
+    """Proxy posture needs the CA volume when the proxy host is set."""
+    with pytest.raises(ValueError, match="Proxy posture requires both"):
         build_container_create_kwargs(
             sandbox_id=SANDBOX_ID,
             user_id=USER_ID,
             tenant_id=TENANT_ID,
             image="onyxdotapp/sandbox:test",
             onyx_pat="pat",
-            api_server_url="https://onyx.example.com",
+            api_server_url="https://onyx.example.com/api",
             network="onyx_craft_sandbox",
             volume_name="vol",
             memory_limit="2g",
@@ -689,6 +842,5 @@ def test_proxy_kwargs_requires_port_and_ca_volume(
             opencode_password=_OPENCODE_PASSWORD,
             opencode_config_json=_OPENCODE_CONFIG_JSON,
             sandbox_proxy_host="sandbox-proxy",
-            sandbox_proxy_port=port,
-            proxy_ca_volume_name=ca_volume,
+            proxy_ca_volume_name=None,
         )
